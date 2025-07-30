@@ -103,8 +103,6 @@ def extract_text(url: str) -> str:
             return extract_text_from_email(url)
         else:
             # Fallback/default logic for unknown extensions or direct links
-            # You might want more sophisticated content-type checking here
-            # e.g., using requests.head(url).headers['Content-Type']
             logger.warning(f"URL does not have a clear file extension: {url}. Attempting as PDF by default.")
             return extract_text_from_pdf(url) # Default to PDF
     except requests.exceptions.RequestException as req_e:
@@ -201,7 +199,20 @@ def run_query(req: QueryRequest):
         if not embeddings:
             raise HTTPException(status_code=500, detail="Failed to generate any embeddings.")
 
-        dim = len(embeddings[0])
+        # --- NEW CHECK FOR EMBEDDING DIMENSION CONSISTENCY ---
+        if embeddings: # Ensure embeddings list is not empty before accessing embeddings[0]
+            first_embedding_dim = len(embeddings[0])
+            logger.info(f"First embedding dimension: {first_embedding_dim}")
+            for i, emb in enumerate(embeddings):
+                if len(emb) != first_embedding_dim:
+                    logger.error(f"Inconsistent embedding dimension at index {i}. Expected {first_embedding_dim}, got {len(emb)}")
+                    raise HTTPException(status_code=500, detail="Inconsistent embedding dimensions generated.")
+            dim = first_embedding_dim
+        else:
+            raise HTTPException(status_code=500, detail="No embeddings generated, cannot determine dimension.")
+        # --- END NEW CHECK ---
+
+        logger.info(f"Initializing VectorStore with dimension: {dim}")
         store = VectorStore(dim)
         store.add(embeddings, chunks)
         logger.info("Successfully created and populated FAISS vector store.")
@@ -209,7 +220,11 @@ def run_query(req: QueryRequest):
         raise
     except Exception as e:
         logger.error(f"Error during chunking, embedding, or vector store creation: {e}")
-        raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): {e}")
+        # Re-raise with a more specific detail if it's the unpacking error
+        if "too many values to unpack" in str(e):
+            raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): Possible dimension mismatch or FAISS issue: {e}")
+        else:
+            raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): {e}")
 
     # 3. For each question: retrieve, reason, answer
     answers = []
@@ -218,6 +233,7 @@ def run_query(req: QueryRequest):
         try:
             question_logger.info(f"Processing question {i+1}/{len(req.questions)}: '{q[:100]}...'")
             q_emb = get_gemini_embedding(q)
+            logger.info(f"Query embedding dimension: {len(q_emb)}")
             
             # Retrieve relevant chunks
             relevant_chunks = store.search(q_emb, top_k=min(3, len(chunks))) # Ensure top_k doesn't exceed available chunks
@@ -234,11 +250,11 @@ def run_query(req: QueryRequest):
     logger.info("All questions processed. Returning responses.")
     return {"answers": answers}
 
-# --- For local development or Render deployment ---
-if __name__ == "__main__":
-    import uvicorn
-    # Get port from environment variable set by Render, or default to 8000
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"Starting Uvicorn server on http://0.0.0.0:{port}")
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True if os.getenv("ENV") == "development" else False)
-    # reload=True is good for local development, set to False for production on Render
+# The `if __name__ == "__main__":` block should be removed/commented out for Render deployment.
+# Based on your previous confirmation, it should already be removed.
+# For local development purposes ONLY, if you need to run main.py directly:
+# if __name__ == "__main__":
+#     import uvicorn
+#     port = int(os.environ.get("PORT", 8000))
+#     logger.info(f"Starting Uvicorn server on http://0.0.0.0:{port}")
+#     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True if os.getenv("ENV") == "development" else False)
