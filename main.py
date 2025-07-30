@@ -50,14 +50,19 @@ def extract_text_from_email(url: str) -> str:
     return msg.get_payload(decode=True).decode(errors="ignore")
 
 def extract_text(url: str) -> str:
-    if url.endswith(".pdf"):
+    # Try to determine file type from URL or content
+    if url.endswith(".pdf") or "pdf" in url.lower():
         return extract_text_from_pdf(url)
-    elif url.endswith(".docx"):
+    elif url.endswith(".docx") or "docx" in url.lower():
         return extract_text_from_docx(url)
-    elif url.endswith(".eml"):
+    elif url.endswith(".eml") or "eml" in url.lower():
         return extract_text_from_email(url)
     else:
-        raise ValueError("Unsupported file type")
+        # Default to PDF for URLs without clear extension
+        try:
+            return extract_text_from_pdf(url)
+        except Exception as e:
+            raise ValueError(f"Could not parse document. Tried PDF format but failed: {e}")
 
 # --- Chunking ---
 def chunk_text(text: str, chunk_size: int = 500) -> List[str]:
@@ -84,6 +89,10 @@ class VectorStore:
 # --- FastAPI Setup ---
 app = FastAPI()
 
+@app.get("/")
+def read_root():
+    return {"message": "LLM-Powered Query Retrieval System is running!", "endpoint": "/api/v1/hackrx/run"}
+
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -95,25 +104,43 @@ class QueryResponse(BaseModel):
 def run_query(req: QueryRequest):
     # 1. Download and parse document
     try:
+        print(f"Attempting to parse document from: {req.documents}")
         text = extract_text(req.documents)
+        print(f"Successfully extracted {len(text)} characters from document")
     except Exception as e:
+        print(f"Document parsing error: {e}")
         raise HTTPException(status_code=400, detail=f"Document parsing failed: {e}")
 
     # 2. Chunk and embed
-    chunks = chunk_text(text)
-    embeddings = [get_gemini_embedding(chunk) for chunk in chunks]
-    dim = len(embeddings[0])
-    store = VectorStore(dim)
-    store.add(embeddings, chunks)
+    try:
+        chunks = chunk_text(text)
+        print(f"Created {len(chunks)} chunks from document")
+        
+        embeddings = [get_gemini_embedding(chunk) for chunk in chunks]
+        print(f"Generated {len(embeddings)} embeddings")
+        
+        dim = len(embeddings[0])
+        store = VectorStore(dim)
+        store.add(embeddings, chunks)
+        print("Successfully created vector store")
+    except Exception as e:
+        print(f"Embedding/vector store error: {e}")
+        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {e}")
 
     # 3. For each question: retrieve, reason, answer
     answers = []
-    for q in req.questions:
-        q_emb = get_gemini_embedding(q)
-        relevant_chunks = store.search(q_emb, top_k=3)
-        context = "\n---\n".join(relevant_chunks)
-        answer = gemini_answer(q, context)
-        answers.append(answer.strip())
+    for i, q in enumerate(req.questions):
+        try:
+            print(f"Processing question {i+1}/{len(req.questions)}: {q[:50]}...")
+            q_emb = get_gemini_embedding(q)
+            relevant_chunks = store.search(q_emb, top_k=3)
+            context = "\n---\n".join(relevant_chunks)
+            answer = gemini_answer(q, context)
+            answers.append(answer.strip())
+            print(f"Successfully answered question {i+1}")
+        except Exception as e:
+            print(f"Error processing question {i+1}: {e}")
+            answers.append(f"Error processing question: {e}")
 
     return {"answers": answers}
 
