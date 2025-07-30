@@ -5,38 +5,53 @@ import fitz  # PyMuPDF
 import docx
 import faiss
 import numpy as np
-import logging # Import logging module
+import logging  # Import logging module
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
 import google.generativeai as genai
 
-# Configure logging
+# Configure logging for better visibility in Render logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Gemini API Setup ---
 # *** IMPORTANT: Get API key from environment variable for security ***
+# This ensures your API key is not hardcoded and is managed securely by Render.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    logger.error("GEMINI_API_KEY environment variable not set. Please set it for production.")
+    logger.error("GEMINI_API_KEY environment variable not set. Please set it in Render dashboard for production.")
     # For local testing, you might temporarily hardcode it here,
-    # but REMOVE IT BEFORE DEPLOYING TO GITHUB/RENDER!
+    # but REMOVE THIS LINE BEFORE DEPLOYING TO GITHUB/RENDER!
     # Example for local development ONLY: GEMINI_API_KEY = "YOUR_HARDCODED_API_KEY_HERE"
     raise ValueError("GEMINI_API_KEY environment variable not set. Cannot proceed.")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
 def get_gemini_embedding(text: str) -> List[float]:
-    """Generates Gemini embeddings for the given text."""
+    """
+    Generates Gemini embeddings for the given text.
+    Includes a critical fix to ensure the embedding is a flat list of floats.
+    """
     try:
-        # Correct way to get embeddings: use genai.embed_content directly
-        # The model name should be prefixed with 'models/'
+        # Call genai.embed_content directly with the model name and content.
+        # The content is provided as a list, as expected by the API.
         resp = genai.embed_content(model="models/embedding-001", content=[text])
-        return resp["embedding"]
+        
+        # The response structure for resp["embedding"] can sometimes be a list containing
+        # the actual embedding vector (e.g., [[...]]).
+        # This block ensures we always extract the flat 768-dimensional list of floats.
+        embedding_vector = resp["embedding"]
+        
+        if isinstance(embedding_vector, list) and len(embedding_vector) == 1 and isinstance(embedding_vector[0], list):
+            embedding_vector = embedding_vector[0]
+            logger.info("DEBUG: Extracted inner list from embedding response.")
+            
+        return embedding_vector
+        
     except Exception as e:
-        logger.error(f"Error generating embedding: {e}")
-        raise
+        logger.error(f"Error generating embedding for text: '{text[:50]}...': {e}")
+        raise # Re-raise the exception after logging
 
 def gemini_answer(question: str, context: str) -> str:
     """Uses Gemini Pro to answer a question based on provided context."""
@@ -50,19 +65,19 @@ def gemini_answer(question: str, context: str) -> str:
         resp = model.generate_content(prompt)
         return resp.text
     except Exception as e:
-        logger.error(f"Error generating answer from Gemini: {e}")
-        raise
+        logger.error(f"Error generating answer from Gemini for question: '{question[:50]}...': {e}")
+        raise # Re-raise the exception after logging
 
-# --- Document Parsing ---
+# --- Document Parsing Functions ---
 def extract_text_from_pdf(url: str) -> str:
     """Extracts text from a PDF document given its URL."""
     response = requests.get(url)
-    response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+    response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
     doc = fitz.open(stream=response.content, filetype="pdf")
     text = ""
     for page in doc:
         text += page.get_text()
-    doc.close() # Close the document after processing
+    doc.close()  # Close the document after processing
     return text
 
 def extract_text_from_docx(url: str) -> str:
@@ -76,17 +91,17 @@ def extract_text_from_email(url: str) -> str:
     """Extracts text from an EML (email) file given its URL."""
     response = requests.get(url)
     response.raise_for_status()
-    from email import message_from_bytes # Import here to avoid global import if not always used
+    from email import message_from_bytes  # Import here to avoid global import if not always used
     msg = message_from_bytes(response.content)
-    # Get the plain text payload; handle multipart emails by iterating through parts
     payload = ""
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
             cdispo = str(part.get('Content-Disposition'))
+            # Only consider plain text parts that are not attachments
             if ctype == 'text/plain' and 'attachment' not in cdispo:
                 payload = part.get_payload(decode=True).decode(errors="ignore")
-                break # Take the first plain text part
+                break  # Take the first plain text part
     else:
         payload = msg.get_payload(decode=True).decode(errors="ignore")
     return payload
@@ -102,9 +117,9 @@ def extract_text(url: str) -> str:
         elif url.lower().endswith(".eml"):
             return extract_text_from_email(url)
         else:
-            # Fallback/default logic for unknown extensions or direct links
+            # Fallback/default logic for URLs without clear extension
             logger.warning(f"URL does not have a clear file extension: {url}. Attempting as PDF by default.")
-            return extract_text_from_pdf(url) # Default to PDF
+            return extract_text_from_pdf(url)  # Default to PDF
     except requests.exceptions.RequestException as req_e:
         logger.error(f"Network or HTTP error fetching document from {url}: {req_e}")
         raise ValueError(f"Failed to fetch document from URL: {req_e}")
@@ -125,6 +140,7 @@ def chunk_text(text: str, chunk_size: int = 500) -> List[str]:
 class VectorStore:
     """In-memory FAISS vector store for document chunks."""
     def __init__(self, dim: int):
+        # Initialize FAISS index with the correct dimension
         self.index = faiss.IndexFlatL2(dim)
         self.chunks = []
 
@@ -153,11 +169,11 @@ def read_root():
     return {"message": "LLM-Powered Query Retrieval System is running!", "endpoint": "/api/v1/hackrx/run"}
 
 class QueryRequest(BaseModel):
-    documents: str # URL to the document (e.g., PDF, DOCX, EML)
-    questions: List[str] # List of questions to ask about the document
+    documents: str  # URL to the document (e.g., PDF, DOCX, EML)
+    questions: List[str]  # List of questions to ask about the document
 
 class QueryResponse(BaseModel):
-    answers: List[str] # List of answers corresponding to the questions
+    answers: List[str]  # List of answers corresponding to the questions
 
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 def run_query(req: QueryRequest):
@@ -177,7 +193,7 @@ def run_query(req: QueryRequest):
     except ValueError as ve:
         logger.error(f"Document parsing failed: {ve}")
         raise HTTPException(status_code=400, detail=f"Document parsing failed: {ve}")
-    except HTTPException: # Re-raise if it was already an HTTPException
+    except HTTPException:  # Re-raise if it was already an HTTPException
         raise
     except Exception as e:
         logger.error(f"An unexpected error occurred during document parsing: {e}")
@@ -199,7 +215,8 @@ def run_query(req: QueryRequest):
         if not embeddings:
             raise HTTPException(status_code=500, detail="Failed to generate any embeddings.")
 
-        # --- CRITICAL DEBUG LOGGING ADDED HERE ---
+        # --- CRITICAL DEBUG LOGGING ---
+        # These logs help diagnose the structure of the embeddings
         if len(embeddings) > 0:
             logger.info(f"DEBUG: Type of embeddings list: {type(embeddings)}")
             logger.info(f"DEBUG: Type of first embedding (embeddings[0]): {type(embeddings[0])}")
@@ -208,10 +225,16 @@ def run_query(req: QueryRequest):
             logger.info(f"DEBUG: First 10 elements of embeddings[0]: {embeddings[0][:10]}")
         # --- END CRITICAL DEBUG LOGGING ---
 
-
-        # --- NEW CHECK FOR EMBEDDING DIMENSION CONSISTENCY ---
-        if embeddings: # Ensure embeddings list is not empty before accessing embeddings[0]
-            first_embedding_dim = len(embeddings[0]) # THIS IS THE LINE THAT WAS POTENTIALLY FAILING
+        # --- Embedding Dimension Consistency Check ---
+        # This ensures all embeddings have the same expected dimension (768 for embedding-001)
+        if embeddings:
+            first_embedding_dim = len(embeddings[0])
+            # The embedding-001 model is expected to return 768 dimensions.
+            # If it's not 768, it indicates an unexpected issue with the model response.
+            if first_embedding_dim != 768:
+                logger.error(f"Expected embedding dimension 768, but got {first_embedding_dim}. This is unexpected.")
+                # You might choose to raise an error here or proceed if you want to allow other dimensions
+                # For now, we proceed as FAISS will handle the dimension passed to VectorStore(dim)
             logger.info(f"First embedding dimension: {first_embedding_dim}")
             for i, emb in enumerate(embeddings):
                 if len(emb) != first_embedding_dim:
@@ -220,7 +243,7 @@ def run_query(req: QueryRequest):
             dim = first_embedding_dim
         else:
             raise HTTPException(status_code=500, detail="No embeddings generated, cannot determine dimension.")
-        # --- END NEW CHECK ---
+        # --- END Embedding Dimension Consistency Check ---
 
         logger.info(f"Initializing VectorStore with dimension: {dim}")
         store = VectorStore(dim)
@@ -239,14 +262,15 @@ def run_query(req: QueryRequest):
     # 3. For each question: retrieve, reason, answer
     answers = []
     for i, q in enumerate(req.questions):
-        question_logger = logger.getChild(f"Question-{i+1}") # Specific logger for each question
+        question_logger = logger.getChild(f"Question-{i+1}")  # Specific logger for each question
         try:
             question_logger.info(f"Processing question {i+1}/{len(req.questions)}: '{q[:100]}...'")
             q_emb = get_gemini_embedding(q)
             logger.info(f"Query embedding dimension: {len(q_emb)}")
             
             # Retrieve relevant chunks
-            relevant_chunks = store.search(q_emb, top_k=min(3, len(chunks))) # Ensure top_k doesn't exceed available chunks
+            # Ensure top_k does not exceed the number of available chunks
+            relevant_chunks = store.search(q_emb, top_k=min(3, len(chunks)))
             context = "\n---\n".join(relevant_chunks)
             
             # Answer using Gemini
@@ -255,16 +279,18 @@ def run_query(req: QueryRequest):
             question_logger.info(f"Successfully answered question {i+1}.")
         except Exception as e:
             question_logger.error(f"Error processing question {i+1}: {e}")
-            answers.append(f"Error processing question: {e}") # Return error message for specific question
+            answers.append(f"Error processing question: {e}")  # Return error message for specific question
 
     logger.info("All questions processed. Returning responses.")
     return {"answers": answers}
 
-# The `if __name__ == "__main__":` block should be removed/commented out for Render deployment.
-# Based on your previous confirmation, it should already be removed.
-# For local development purposes ONLY, if you need to run main.py directly:
+# --- For local development or Render deployment ---
+# This block is typically removed or commented out for Docker-based deployments
+# like on Render, as the Dockerfile's CMD instruction handles the server startup.
 # if __name__ == "__main__":
 #     import uvicorn
+#     # Get port from environment variable set by Render, or default to 8000
 #     port = int(os.environ.get("PORT", 8000))
 #     logger.info(f"Starting Uvicorn server on http://0.0.0.0:{port}")
+#     # reload=True is good for local development, set to False for production on Render
 #     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True if os.getenv("ENV") == "development" else False)
