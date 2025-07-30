@@ -199,9 +199,19 @@ def run_query(req: QueryRequest):
         if not embeddings:
             raise HTTPException(status_code=500, detail="Failed to generate any embeddings.")
 
+        # --- CRITICAL DEBUG LOGGING ADDED HERE ---
+        if len(embeddings) > 0:
+            logger.info(f"DEBUG: Type of embeddings list: {type(embeddings)}")
+            logger.info(f"DEBUG: Type of first embedding (embeddings[0]): {type(embeddings[0])}")
+            logger.info(f"DEBUG: Length of first embedding (len(embeddings[0])): {len(embeddings[0])}")
+            # Log a small snippet of the first embedding to see its structure
+            logger.info(f"DEBUG: First 10 elements of embeddings[0]: {embeddings[0][:10]}")
+        # --- END CRITICAL DEBUG LOGGING ---
+
+
         # --- NEW CHECK FOR EMBEDDING DIMENSION CONSISTENCY ---
         if embeddings: # Ensure embeddings list is not empty before accessing embeddings[0]
-            first_embedding_dim = len(embeddings[0])
+            first_embedding_dim = len(embeddings[0]) # THIS IS THE LINE THAT WAS POTENTIALLY FAILING
             logger.info(f"First embedding dimension: {first_embedding_dim}")
             for i, emb in enumerate(embeddings):
                 if len(emb) != first_embedding_dim:
