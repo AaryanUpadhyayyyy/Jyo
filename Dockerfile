@@ -1,6 +1,13 @@
 # Use a lightweight Python base image
 FROM python:3.9-slim-buster
 
+# Install build tools and SWIG (required for faiss-cpu compilation)
+# We need build-essential for C/C++ compilers and related tools
+# We need swig for generating Python bindings for FAISS
+RUN apt-get update && \
+    apt-get install -y build-essential swig && \
+    rm -rf /var/lib/apt/lists/*
+
 # Set the working directory inside the container
 WORKDIR /app
 
