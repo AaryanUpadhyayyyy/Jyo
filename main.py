@@ -65,14 +65,28 @@ def gemini_answer(question: str, context: str) -> str:
     """
     Uses Gemini to answer a question based on provided context.
     Model changed from 'gemini-pro' to 'gemini-1.5-flash' for broader availability.
+    Enhanced prompt for better accuracy and citation.
     """
     # Changed model to 'gemini-1.5-flash' for better compatibility and availability
     model = genai.GenerativeModel("gemini-1.5-flash") 
+    
+    # --- ENHANCED PROMPT ENGINEERING ---
     prompt = (
-        f"Given the following context from a policy/contract:\n\n{context}\n\n"
-        f"Answer the question: '{question}'\n"
-        "If possible, cite the relevant clause(s) and explain your reasoning."
+        f"You are an extremely meticulous and precise expert assistant specializing in legal and policy document analysis. "
+        f"Your primary directive is to answer the user's question with absolute fidelity to the provided 'Context'. "
+        f"**Strictly adhere to the following rules:**\n"
+        f"1.  **Source-Based Only:** Your answer MUST be derived *exclusively* from the 'Context' provided below. Do NOT use any external knowledge, common sense, or make assumptions.\n"
+        f"2.  **No Hallucination:** If the answer is not explicitly present or directly inferable from the 'Context', you MUST state: 'The provided text does not contain this information.' Do NOT attempt to guess or fabricate an answer.\n"
+        f"3.  **Conciseness:** Provide the most direct and concise answer possible while still being comprehensive.\n"
+        f"4.  **Citation:** For every piece of information in your answer, identify and cite the specific clause number, section heading, or a clear reference from the 'Context' that supports it. If a direct citation is not possible (e.g., general summary), state that the information is derived from the overall context.\n"
+        f"5.  **Reasoning:** Briefly explain *how* your answer is derived from the cited context, focusing on the logical connection.\n"
+        f"6.  **Format:** Present your answer clearly, separating the answer from the citation and reasoning.\n\n"
+        f"**Context from Policy/Contract:**\n\n{context}\n\n"
+        f"**Question:** '{question}'\n\n"
+        f"**Your Answer:**\n"
     )
+    # --- END ENHANCED PROMPT ENGINEERING ---
+
     try:
         resp = model.generate_content(prompt)
         return resp.text
@@ -140,13 +154,57 @@ def extract_text(url: str) -> str:
         raise ValueError(f"Could not parse document. Check URL and file type: {e}")
 
 # --- Chunking ---
-def chunk_text(text: str, chunk_size: int = 500) -> List[str]:
-    """Splits text into smaller chunks for embedding."""
-    words = text.split()
-    return [
-        " ".join(words[i:i+chunk_size])
-        for i in range(0, len(words), chunk_size)
-    ]
+def chunk_text(text: str, max_chunk_words: int = 700, chunk_overlap_words: int = 100) -> List[str]:
+    """
+    Splits text into chunks, prioritizing paragraph boundaries, then word-based if paragraphs are too long.
+    Includes overlap for context preservation.
+    """
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    chunks = []
+    current_chunk_words = []
+    current_chunk_length = 0
+
+    for paragraph in paragraphs:
+        paragraph_words = paragraph.split()
+        
+        # If adding the whole paragraph exceeds max_chunk_words, or if current_chunk is empty and paragraph is huge
+        if current_chunk_length + len(paragraph_words) > max_chunk_words and current_chunk_words:
+            chunks.append(" ".join(current_chunk_words))
+            
+            # Create overlap: take the last chunk_overlap_words from the previous chunk
+            overlap_words = current_chunk_words[max(0, len(current_chunk_words) - chunk_overlap_words):]
+            current_chunk_words = overlap_words
+            current_chunk_length = len(overlap_words)
+        
+        # If the paragraph itself is larger than max_chunk_words, split it further
+        if len(paragraph_words) > max_chunk_words:
+            # Add current_chunk if it has content before splitting large paragraph
+            if current_chunk_words:
+                chunks.append(" ".join(current_chunk_words))
+                current_chunk_words = [] # Reset after adding
+                current_chunk_length = 0
+
+            # Split the large paragraph into sub-chunks
+            sub_start_index = 0
+            while sub_start_index < len(paragraph_words):
+                sub_end_index = min(sub_start_index + max_chunk_words, len(paragraph_words))
+                sub_chunk = " ".join(paragraph_words[sub_start_index:sub_end_index])
+                chunks.append(sub_chunk)
+                sub_start_index += max_chunk_words - chunk_overlap_words
+                if sub_start_index < 0: # Handle edge case where overlap is larger than chunk_size
+                    sub_start_index = 0
+            
+            current_chunk_words = [] # Reset after handling large paragraph
+            current_chunk_length = 0
+        else:
+            current_chunk_words.extend(paragraph_words)
+            current_chunk_length += len(current_chunk_words) # Corrected to use current_chunk_words length
+    
+    # Add any remaining words in current_chunk_words
+    if current_chunk_words:
+        chunks.append(" ".join(current_chunk_words))
+
+    return chunks
 
 # --- FAISS Vector Store ---
 class VectorStore:
@@ -162,7 +220,7 @@ class VectorStore:
         self.index.add(np.array(embeddings).astype("float32"))
         self.chunks.extend(chunks)
 
-    def search(self, embedding: List[float], top_k: int = 3):
+    def search(self, embedding: List[float], top_k: int = 5): # Increased top_k for more context
         """Searches for the most similar chunks to a given embedding."""
         # Ensure query embedding is float32 and 2D array for FAISS search
         D, I = self.index.search(np.array([embedding]).astype("float32"), top_k)
@@ -216,7 +274,8 @@ def run_query(req: QueryRequest):
     embeddings = []
     store = None
     try:
-        chunks = chunk_text(text)
+        # Calling chunk_text with new parameters
+        chunks = chunk_text(text, max_chunk_words=700, chunk_overlap_words=100) 
         if not chunks:
             raise HTTPException(status_code=400, detail="No chunks generated from document. Text might be too short or chunking failed.")
         logger.info(f"Created {len(chunks)} chunks from document.")
@@ -280,9 +339,8 @@ def run_query(req: QueryRequest):
             q_emb = get_gemini_embedding(q)
             logger.info(f"Query embedding dimension: {len(q_emb)}")
             
-            # Retrieve relevant chunks
-            # Ensure top_k does not exceed the number of available chunks
-            relevant_chunks = store.search(q_emb, top_k=min(3, len(chunks)))
+            # Retrieve more relevant chunks (e.g., top_k=5 instead of 3)
+            relevant_chunks = store.search(q_emb, top_k=min(5, len(chunks))) # Changed top_k to 5
             context = "\n---\n".join(relevant_chunks)
             
             # Answer using Gemini
