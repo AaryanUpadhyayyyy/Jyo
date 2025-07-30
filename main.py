@@ -26,6 +26,14 @@ if not GEMINI_API_KEY:
     # Example for local development ONLY: GEMINI_API_KEY = "YOUR_HARDCODED_API_KEY_HERE"
     raise ValueError("GEMINI_API_KEY environment variable not set. Cannot proceed.")
 
+# --- CRITICAL DEBUG LOGGING FOR API KEY ---
+# This line will print the first 5 characters of your API key to the logs.
+# This is for DEBUGGING ONLY to confirm which key Render is using.
+# REMOVE THIS LINE IN PRODUCTION FOR SECURITY!
+if GEMINI_API_KEY:
+    logger.info(f"DEBUG: Using Gemini API Key starting with: {GEMINI_API_KEY[:5]}*****")
+# --- END DEBUG LOGGING ---
+
 genai.configure(api_key=GEMINI_API_KEY)
 
 def get_gemini_embedding(text: str) -> List[float]:
@@ -298,3 +306,51 @@ def run_query(req: QueryRequest):
 #     logger.info(f"Starting Uvicorn server on http://0.0.0.0:{port}")
 #     # reload=True is good for local development, set to False for production on Render
 #     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True if os.getenv("ENV") == "development" else False)
+
+I acknowledge your request and will provide guidance based on the selected code from the Canvas.
+
+You're referring to the code snippet from the "test.py Script for API Testing" Canvas.
+
+The issue you're encountering, "Error processing question: 429 You exceeded your current quota," even after trying a new Gmail ID, a new Google Cloud project, and a new API key, is indeed puzzling if all steps were followed correctly.
+
+Given that you're on the "Create OAuth client ID" screen, this indicates a potential misstep in the process of generating credentials for your backend service. OAuth Client IDs are primarily for **user-facing applications** that authenticate users and access *their* data with consent. Your FastAPI backend, which calls the Gemini API, needs to authenticate as an **application**, not as a user.
+
+The most likely reason you're still hitting the quota is that the API key you're using is either:
+1.  **Still associated with a project that has exhausted its daily quota.**
+2.  **Not correctly linked to the new project you created.**
+3.  **A Service Account key (if you went down that path) is not being used correctly by your application.**
+
+**To fix this, you need to ensure you are generating a simple API Key (or a Service Account Key) that is correctly linked to your new Google Cloud Project and has fresh quotas.**
+
+Here's the most straightforward path to get a new API Key for your backend, ensuring it's tied to your new project:
+
+**Step 1: Ensure you are in the *correct, new* Google Cloud Project.**
+
+* Go to `https://console.cloud.google.com/`.
+* At the top of the page, click on the project selector dropdown (it usually shows the current project name).
+* **Select the brand new Google Cloud Project you created** (the one that should have fresh quotas). Make absolutely sure you're not in your old project.
+
+**Step 2: Generate a New API Key within this *New Project*.**
+
+* Once your new project is selected, in the left-hand navigation menu, go to **"APIs & Services" > "Credentials"**.
+* Click the **"+ CREATE CREDENTIALS"** button at the top.
+* From the dropdown menu, select **"API Key"**.
+    * **Do NOT select "OAuth client ID" or "Service account" at this point, unless you specifically intend to set up a service account for your backend (which is more complex than just an API key).**
+* A new API key will be generated and displayed in a pop-up window. **Immediately copy this key!** This is your new key with fresh free-tier quotas.
+* (Optional but Recommended for security): In the same pop-up, click "Restrict Key". Under "API restrictions," select **"Restrict key"** and choose **"Generative Language API"** from the dropdown list. Click "Save".
+
+**Step 3: Update the `GEMINI_API_KEY` in Render.**
+
+* Go to your Render Dashboard (`https://dashboard.render.com/`).
+* Select your `Jyo` web service.
+* Go to the **"Environment"** tab.
+* Find your `GEMINI_API_KEY` environment variable.
+* Click the edit icon (pencil) next to it, and **paste this brand new API key** (from Step 2) into the "Value" field.
+* Click "Save Changes." This will trigger a redeployment of your Render service.
+
+**Step 4: Wait for Render Deployment and Test.**
+
+* Monitor the Render logs to ensure the new deployment completes successfully.
+* Once it's live, run your `test.py` script again.
+
+By following these steps precisely, you should be using a fresh API key from a new project, which should resolve the daily quota issue. If this still fails, it suggests a very unusual edge case, and enabling billing would be the next definitive st
