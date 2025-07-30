@@ -54,8 +54,12 @@ def get_gemini_embedding(text: str) -> List[float]:
         raise # Re-raise the exception after logging
 
 def gemini_answer(question: str, context: str) -> str:
-    """Uses Gemini Pro to answer a question based on provided context."""
-    model = genai.GenerativeModel("gemini-pro")
+    """
+    Uses Gemini to answer a question based on provided context.
+    Model changed from 'gemini-pro' to 'gemini-1.5-flash' for broader availability.
+    """
+    # Changed model to 'gemini-1.5-flash' for better compatibility and availability
+    model = genai.GenerativeModel("gemini-1.5-flash") 
     prompt = (
         f"Given the following context from a policy/contract:\n\n{context}\n\n"
         f"Answer the question: '{question}'\n"
