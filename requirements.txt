@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+requests
+PyMuPDF
+python-docx
+faiss-cpu
+google-generativeai 
