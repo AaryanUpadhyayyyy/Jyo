@@ -140,7 +140,7 @@ def gemini_answer(question: str, context: str) -> str:
     """
     Uses Gemini to answer a question based on provided context.
     Model changed from 'gemini-pro' to 'gemini-1.5-flash' for broader availability.
-    Enhanced prompt for better accuracy and citation.
+    Simplified prompt for more concise, direct answers.
     """
     model = genai.GenerativeModel("gemini-1.5-flash") 
     
@@ -228,7 +228,7 @@ def extract_text(url: str) -> str:
         raise ValueError(f"Could not parse document. Check URL and file type: {e}")
 
 # --- Chunking ---
-def chunk_text(text: str, max_chunk_words: int = 1500, chunk_overlap_words: int = 200) -> List[str]:
+def chunk_text(text: str, max_chunk_words: int = 1000, chunk_overlap_words: int = 150) -> List[str]:
     """
     Splits text into chunks, prioritizing paragraph boundaries, then word-based if paragraphs are too long.
     Includes overlap for context preservation.
@@ -361,7 +361,7 @@ def run_query(req: QueryRequest):
     store = None
     try:
         # Calling chunk_text with new parameters for larger, overlapping, paragraph-aware chunks
-        chunks = chunk_text(text, max_chunk_words=1500, chunk_overlap_words=200) 
+        chunks = chunk_text(text, max_chunk_words=1000, chunk_overlap_words=150) 
         if not chunks:
             raise HTTPException(status_code=400, detail="No chunks generated from document. Text might be too short or chunking failed.")
         logger.info(f"Created {len(chunks)} chunks from document.")
