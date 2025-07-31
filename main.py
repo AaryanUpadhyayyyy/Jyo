@@ -140,26 +140,18 @@ def gemini_answer(question: str, context: str) -> str:
     """
     Uses Gemini to answer a question based on provided context.
     Model changed from 'gemini-pro' to 'gemini-1.5-flash' for broader availability.
-    Simplified prompt for more concise, direct answers.
+    This version simplifies the prompt for a concise, direct answer.
     """
-    model = genai.GenerativeModel("gemini-1.5-flash") 
+    model = genai.GenerativeModel("gemini-1.5-flash")
     
-    # --- ULTIMATE PROMPT ENGINEERING ---
+    # --- SIMPLIFIED, CONCISE PROMPT FOR DIRECT ANSWERS ---
     prompt = (
-        f"You are an extremely meticulous, precise, and highly reliable expert assistant specializing in legal and policy document analysis. "
-        f"Your primary directive is to answer the user's question with **absolute fidelity** to the provided 'Context'. "
-        f"**Strictly adhere to the following rules for generating your answer:**\n"
-        f"1.  **Source-Based Only:** Your answer MUST be derived *exclusively* from the 'Context' provided below. Do NOT use any external knowledge, common sense, or make assumptions. Every piece of information in your answer must be directly traceable to the provided context.\n"
-        f"2.  **No Hallucination:** If the answer to the question, or any part of it, is not explicitly present or directly inferable from the 'Context', you MUST clearly state: 'The provided text does not contain this information.' Do NOT attempt to guess, fabricate, or infer beyond what is explicitly stated.\n"
-        f"3.  **Conciseness & Directness:** Provide the most direct and concise answer possible while still being comprehensive and accurate based on the context.\n"
-        f"4.  **Direct Quotes & Exact Citations:** Whenever possible, include direct quotes from the context to support your answer. For every piece of information provided, you MUST cite the relevant clause number, section heading, or a clear reference from the 'Context' that directly supports it. If no specific clause is available but the information is from a general section, state 'From general context in [Section Name/Relevant Chunk]'.\n"
-        f"5.  **Reasoning:** Briefly explain *how* your answer is derived from the cited context, focusing on the logical connection between the question, the context, and your answer.\n"
-        f"6.  **Output Format:** Present your answer clearly, separating the main answer from the citation and reasoning. **Before providing the final answer, first list the exact context segments (directly quoted) that you used to formulate your answer.**\n\n"
-        f"**Context from Policy/Contract:**\n\n{context}\n\n"
-        f"**Question:** '{question}'\n\n"
-        f"**Your Answer:**\n"
+        f"Given the following context from a policy/contract:\n\n{context}\n\n"
+        f"Answer the question: '{question}' concisely and directly. "
+        f"If the answer is not in the context, say 'The provided text does not contain this information.'. "
+        f"Do not add any additional commentary, reasoning, or quotes unless they are the direct answer."
     )
-    # --- END ULTIMATE PROMPT ENGINEERING ---
+    # --- END SIMPLIFIED, CONCISE PROMPT ---
 
     try:
         resp = model.generate_content(prompt)
