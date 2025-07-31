@@ -147,7 +147,7 @@ def gemini_answer(question: str, context: str) -> str:
     # --- SIMPLIFIED, CONCISE PROMPT FOR DIRECT ANSWERS ---
     prompt = (
         f"Given the following context from a policy/contract:\n\n{context}\n\n"
-        f"Answer the question: '{question}' concisely and directly. "
+        f"Answer the question: '{question}' concisely and directly in a complete sentence. "
         f"If the answer is not in the context, say 'The provided text does not contain this information.'. "
         f"Do not add any additional commentary, reasoning, or quotes unless they are the direct answer."
     )
