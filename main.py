@@ -8,7 +8,7 @@ import numpy as np
 import logging  # Import logging module
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Tuple
 import google.generativeai as genai
 
 # Configure logging for better visibility in Render logs
@@ -36,6 +36,12 @@ if GEMINI_API_KEY:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
+# --- Feature Flags ---
+# Control LLM-aided re-ranking via an environment variable for A/B testing
+ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "true"
+logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING}")
+
+
 def get_gemini_embedding(text: str) -> List[float]:
     """
     Generates Gemini embeddings for the given text.
@@ -61,13 +67,81 @@ def get_gemini_embedding(text: str) -> List[float]:
         logger.error(f"Error generating embedding for text: '{text[:50]}...': {e}")
         raise # Re-raise the exception after logging
 
+def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5) -> List[str]:
+    """
+    Uses Gemini to re-rank a list of chunks based on their relevance to the query.
+    This helps filter out less relevant chunks even if their embeddings were close.
+    
+    Args:
+        query (str): The user's question.
+        chunks (List[str]): A list of candidate text chunks.
+        top_n_rerank (int): The number of top-ranked chunks to return.
+
+    Returns:
+        List[str]: A list of re-ranked (and potentially filtered) chunks.
+    """
+    if not chunks:
+        return []
+
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    rerank_prompt = (
+        f"Given the following user query and a list of text segments, "
+        f"identify the {top_n_rerank} most relevant segments that are most likely to contain the answer to the query. "
+        f"Rank them from most relevant to least relevant.\n"
+        f"Return ONLY the content of the selected segments, each on a new line, exactly as they appear in the input list.\n"
+        f"Do NOT add any introductory or concluding remarks, just the segments.\n"
+        f"If fewer than {top_n_rerank} relevant segments are found, return all relevant ones.\n\n"
+        f"**User Query:** '{query}'\n\n"
+        f"**Text Segments (each prefixed with 'Segment X:'):**\n"
+    )
+    for i, chunk in enumerate(chunks):
+        rerank_prompt += f"Segment {i+1}: {chunk}\n"
+    
+    try:
+        logger.info(f"Calling Gemini for chunk re-ranking with {len(chunks)} chunks.")
+        resp = model.generate_content(rerank_prompt)
+        ranked_segments_text = resp.text.strip()
+        
+        # Parse the response to extract the re-ranked chunks
+        re_ranked_chunks = []
+        for line in ranked_segments_text.split('\n'):
+            # Simple heuristic: try to match the exact segment content
+            # This can be improved with more robust parsing if Gemini's output varies
+            for original_chunk in chunks:
+                if original_chunk.strip() == line.strip():
+                    re_ranked_chunks.append(original_chunk)
+                    break
+        
+        # Ensure we return at most top_n_rerank unique chunks in order
+        seen_chunks = set()
+        final_re_ranked = []
+        for chunk in re_ranked_chunks:
+            if chunk not in seen_chunks:
+                final_re_ranked.append(chunk)
+                seen_chunks.add(chunk)
+            if len(final_re_ranked) >= top_n_rerank:
+                break
+        
+        # If Gemini didn't return enough, fall back to top_n_rerank from original list
+        if len(final_re_ranked) < top_n_rerank and len(chunks) > 0:
+            logger.warning(f"Gemini re-ranking returned fewer than {top_n_rerank} chunks. Falling back to top {top_n_rerank} from original retrieval.")
+            return chunks[:top_n_rerank] # Fallback to original top N
+        
+        return final_re_ranked
+
+    except Exception as e:
+        logger.error(f"Error during LLM-aided chunk re-ranking for query '{query[:50]}...': {e}")
+        # Fallback to original chunks if re-ranking fails
+        return chunks[:top_n_rerank] # Return original top_n_rerank chunks if re-ranking fails
+
+
 def gemini_answer(question: str, context: str) -> str:
     """
     Uses Gemini to answer a question based on provided context.
     Model changed from 'gemini-pro' to 'gemini-1.5-flash' for broader availability.
     Enhanced prompt for better accuracy and citation.
     """
-    # Changed model to 'gemini-1.5-flash' for better compatibility and availability
     model = genai.GenerativeModel("gemini-1.5-flash") 
     
     # --- ULTIMATE PROMPT ENGINEERING ---
@@ -80,7 +154,7 @@ def gemini_answer(question: str, context: str) -> str:
         f"3.  **Conciseness & Directness:** Provide the most direct and concise answer possible while still being comprehensive and accurate based on the context.\n"
         f"4.  **Direct Quotes & Exact Citations:** Whenever possible, include direct quotes from the context to support your answer. For every piece of information provided, you MUST cite the relevant clause number, section heading, or a clear reference from the 'Context' that directly supports it. If no specific clause is available but the information is from a general section, state 'From general context in [Section Name/Relevant Chunk]'.\n"
         f"5.  **Reasoning:** Briefly explain *how* your answer is derived from the cited context, focusing on the logical connection between the question, the context, and your answer.\n"
-        f"6.  **Output Format:** Present your answer in a clear, structured manner, separating the main answer from the citation and reasoning.\n\n"
+        f"6.  **Output Format:** Present your answer clearly, separating the main answer from the citation and reasoning. **Before providing the final answer, first list the exact context segments (directly quoted) that you used to formulate your answer.**\n\n"
         f"**Context from Policy/Contract:**\n\n{context}\n\n"
         f"**Question:** '{question}'\n\n"
         f"**Your Answer:**\n"
@@ -162,49 +236,61 @@ def chunk_text(text: str, max_chunk_words: int = 1500, chunk_overlap_words: int 
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     chunks = []
     current_chunk_words = []
-    current_chunk_length = 0
-
+    
     for paragraph in paragraphs:
         paragraph_words = paragraph.split()
         
-        # If adding the whole paragraph exceeds max_chunk_words, or if current_chunk is empty and paragraph is huge
-        if current_chunk_length + len(paragraph_words) > max_chunk_words and current_chunk_words:
+        # Check if adding the current paragraph would exceed the max_chunk_words
+        # and if there's already content in current_chunk_words
+        if len(current_chunk_words) + len(paragraph_words) > max_chunk_words and current_chunk_words:
             chunks.append(" ".join(current_chunk_words))
             
-            # Create overlap: take the last chunk_overlap_words from the previous chunk
+            # Create overlap for the next chunk
             overlap_words = current_chunk_words[max(0, len(current_chunk_words) - chunk_overlap_words):]
             current_chunk_words = overlap_words
-            current_chunk_length = len(overlap_words)
         
-        # If the paragraph itself is larger than max_chunk_words, split it further
+        # Handle paragraphs that are larger than max_chunk_words by splitting them
         if len(paragraph_words) > max_chunk_words:
-            # Add current_chunk if it has content before splitting large paragraph
+            # Add any accumulated current_chunk_words before processing large paragraph
             if current_chunk_words:
                 chunks.append(" ".join(current_chunk_words))
-                current_chunk_words = [] # Reset after adding
-                current_chunk_length = 0
+                current_chunk_words = [] # Reset for next accumulation
 
-            # Split the large paragraph into sub-chunks
+            # Split the large paragraph into sub-chunks with overlap
             sub_start_index = 0
             while sub_start_index < len(paragraph_words):
                 sub_end_index = min(sub_start_index + max_chunk_words, len(paragraph_words))
                 sub_chunk = " ".join(paragraph_words[sub_start_index:sub_end_index])
                 chunks.append(sub_chunk)
                 sub_start_index += max_chunk_words - chunk_overlap_words
-                if sub_start_index < 0: # Handle edge case where overlap is larger than chunk_size
+                # Ensure sub_start_index doesn't go backwards if overlap is larger than chunk_size
+                if sub_start_index < 0: 
                     sub_start_index = 0
             
             current_chunk_words = [] # Reset after handling large paragraph
-            current_chunk_length = 0
         else:
             current_chunk_words.extend(paragraph_words)
-            current_chunk_length = len(current_chunk_words) # Corrected to use current_chunk_words length
     
-    # Add any remaining words in current_chunk_words
+    # Add any remaining words in current_chunk_words as the last chunk
     if current_chunk_words:
         chunks.append(" ".join(current_chunk_words))
 
     return chunks
+
+def keyword_search(query: str, all_chunks: List[str], top_n_keywords: int = 3) -> List[str]:
+    """
+    Performs a simple keyword search to find chunks containing query terms.
+    Extracts keywords from the query and finds chunks that contain them.
+    """
+    query_words = [word.lower() for word in query.split() if len(word) > 2] # Filter out very short words
+    
+    relevant_keyword_chunks = []
+    for chunk in all_chunks:
+        if any(keyword in chunk.lower() for keyword in query_words):
+            relevant_keyword_chunks.append(chunk)
+            if len(relevant_keyword_chunks) >= top_n_keywords: # Limit number of keyword chunks
+                break
+    return relevant_keyword_chunks
 
 # --- FAISS Vector Store ---
 class VectorStore:
@@ -339,16 +425,35 @@ def run_query(req: QueryRequest):
             q_emb = get_gemini_embedding(q)
             logger.info(f"Query embedding dimension: {len(q_emb)}")
             
-            # Retrieve more relevant chunks (top_k increased to 8)
-            relevant_chunks = store.search(q_emb, top_k=min(8, len(chunks))) # Changed top_k to 8
-            
+            # --- Retrieval Augmentation ---
+            # 1. Semantic Search (FAISS)
+            faiss_relevant_chunks = store.search(q_emb, top_k=8) # Initial top_k for FAISS
+            question_logger.info(f"FAISS retrieved {len(faiss_relevant_chunks)} chunks.")
+
+            # 2. Keyword Search Augmentation
+            keyword_relevant_chunks = keyword_search(q, chunks, top_n_keywords=3)
+            question_logger.info(f"Keyword search retrieved {len(keyword_relevant_chunks)} chunks.")
+
+            # Combine and deduplicate chunks
+            combined_candidate_chunks = list(dict.fromkeys(faiss_relevant_chunks + keyword_relevant_chunks))
+            question_logger.info(f"Combined candidate chunks (deduplicated): {len(combined_candidate_chunks)} chunks.")
+
+            # 3. LLM-Aided Re-ranking (Conditional based on feature flag)
+            if ENABLE_LLM_RERANKING:
+                final_context_chunks = re_rank_chunks_with_llm(q, combined_candidate_chunks, top_n_rerank=5) # Re-rank to top 5
+                question_logger.info(f"LLM re-ranked to {len(final_context_chunks)} final context chunks (re-ranking enabled).")
+            else:
+                final_context_chunks = combined_candidate_chunks[:5] # Fallback to top 5 from combined if re-ranking disabled
+                question_logger.info(f"Re-ranking disabled. Using top 5 from combined candidate chunks.")
+            # --- END Retrieval Augmentation ---
+
             # --- RIGOROUS LOGGING: Log the chunks passed to LLM ---
-            question_logger.info(f"Context chunks passed to LLM for Q{i+1}:")
-            for j, chunk in enumerate(relevant_chunks):
+            question_logger.info(f"Final context chunks passed to LLM for Q{i+1}:")
+            for j, chunk in enumerate(final_context_chunks):
                 question_logger.info(f"  Chunk {j+1} (length {len(chunk.split())} words): '{chunk[:200]}...'")
             # --- END RIGOROUS LOGGING ---
 
-            context = "\n---\n".join(relevant_chunks)
+            context = "\n---\n".join(final_context_chunks)
             
             # Answer using Gemini
             answer = gemini_answer(q, context)
