@@ -70,22 +70,22 @@ def gemini_answer(question: str, context: str) -> str:
     # Changed model to 'gemini-1.5-flash' for better compatibility and availability
     model = genai.GenerativeModel("gemini-1.5-flash") 
     
-    # --- ENHANCED PROMPT ENGINEERING ---
+    # --- ULTIMATE PROMPT ENGINEERING ---
     prompt = (
-        f"You are an extremely meticulous and precise expert assistant specializing in legal and policy document analysis. "
-        f"Your primary directive is to answer the user's question with absolute fidelity to the provided 'Context'. "
-        f"**Strictly adhere to the following rules:**\n"
-        f"1.  **Source-Based Only:** Your answer MUST be derived *exclusively* from the 'Context' provided below. Do NOT use any external knowledge, common sense, or make assumptions.\n"
-        f"2.  **No Hallucination:** If the answer is not explicitly present or directly inferable from the 'Context', you MUST state: 'The provided text does not contain this information.' Do NOT attempt to guess or fabricate an answer.\n"
-        f"3.  **Conciseness:** Provide the most direct and concise answer possible while still being comprehensive.\n"
-        f"4.  **Citation:** For every piece of information in your answer, identify and cite the specific clause number, section heading, or a clear reference from the 'Context' that supports it. If a direct citation is not possible (e.g., general summary), state that the information is derived from the overall context.\n"
-        f"5.  **Reasoning:** Briefly explain *how* your answer is derived from the cited context, focusing on the logical connection.\n"
-        f"6.  **Format:** Present your answer clearly, separating the answer from the citation and reasoning.\n\n"
+        f"You are an extremely meticulous, precise, and highly reliable expert assistant specializing in legal and policy document analysis. "
+        f"Your primary directive is to answer the user's question with **absolute fidelity** to the provided 'Context'. "
+        f"**Strictly adhere to the following rules for generating your answer:**\n"
+        f"1.  **Source-Based Only:** Your answer MUST be derived *exclusively* from the 'Context' provided below. Do NOT use any external knowledge, common sense, or make assumptions. Every piece of information in your answer must be directly traceable to the provided context.\n"
+        f"2.  **No Hallucination:** If the answer to the question, or any part of it, is not explicitly present or directly inferable from the 'Context', you MUST clearly state: 'The provided text does not contain this information.' Do NOT attempt to guess, fabricate, or infer beyond what is explicitly stated.\n"
+        f"3.  **Conciseness & Directness:** Provide the most direct and concise answer possible while still being comprehensive and accurate based on the context.\n"
+        f"4.  **Direct Quotes & Exact Citations:** Whenever possible, include direct quotes from the context to support your answer. For every piece of information provided, you MUST cite the relevant clause number, section heading, or a clear reference from the 'Context' that directly supports it. If no specific clause is available but the information is from a general section, state 'From general context in [Section Name/Relevant Chunk]'.\n"
+        f"5.  **Reasoning:** Briefly explain *how* your answer is derived from the cited context, focusing on the logical connection between the question, the context, and your answer.\n"
+        f"6.  **Output Format:** Present your answer in a clear, structured manner, separating the main answer from the citation and reasoning.\n\n"
         f"**Context from Policy/Contract:**\n\n{context}\n\n"
         f"**Question:** '{question}'\n\n"
         f"**Your Answer:**\n"
     )
-    # --- END ENHANCED PROMPT ENGINEERING ---
+    # --- END ULTIMATE PROMPT ENGINEERING ---
 
     try:
         resp = model.generate_content(prompt)
@@ -154,7 +154,7 @@ def extract_text(url: str) -> str:
         raise ValueError(f"Could not parse document. Check URL and file type: {e}")
 
 # --- Chunking ---
-def chunk_text(text: str, max_chunk_words: int = 700, chunk_overlap_words: int = 100) -> List[str]:
+def chunk_text(text: str, max_chunk_words: int = 1500, chunk_overlap_words: int = 200) -> List[str]:
     """
     Splits text into chunks, prioritizing paragraph boundaries, then word-based if paragraphs are too long.
     Includes overlap for context preservation.
@@ -198,7 +198,7 @@ def chunk_text(text: str, max_chunk_words: int = 700, chunk_overlap_words: int =
             current_chunk_length = 0
         else:
             current_chunk_words.extend(paragraph_words)
-            current_chunk_length += len(current_chunk_words) # Corrected to use current_chunk_words length
+            current_chunk_length = len(current_chunk_words) # Corrected to use current_chunk_words length
     
     # Add any remaining words in current_chunk_words
     if current_chunk_words:
@@ -220,7 +220,7 @@ class VectorStore:
         self.index.add(np.array(embeddings).astype("float32"))
         self.chunks.extend(chunks)
 
-    def search(self, embedding: List[float], top_k: int = 5): # Increased top_k for more context
+    def search(self, embedding: List[float], top_k: int = 8): # Increased top_k to 8 for more context
         """Searches for the most similar chunks to a given embedding."""
         # Ensure query embedding is float32 and 2D array for FAISS search
         D, I = self.index.search(np.array([embedding]).astype("float32"), top_k)
@@ -274,8 +274,8 @@ def run_query(req: QueryRequest):
     embeddings = []
     store = None
     try:
-        # Calling chunk_text with new parameters
-        chunks = chunk_text(text, max_chunk_words=700, chunk_overlap_words=100) 
+        # Calling chunk_text with new parameters for larger, overlapping, paragraph-aware chunks
+        chunks = chunk_text(text, max_chunk_words=1500, chunk_overlap_words=200) 
         if not chunks:
             raise HTTPException(status_code=400, detail="No chunks generated from document. Text might be too short or chunking failed.")
         logger.info(f"Created {len(chunks)} chunks from document.")
@@ -339,8 +339,15 @@ def run_query(req: QueryRequest):
             q_emb = get_gemini_embedding(q)
             logger.info(f"Query embedding dimension: {len(q_emb)}")
             
-            # Retrieve more relevant chunks (e.g., top_k=5 instead of 3)
-            relevant_chunks = store.search(q_emb, top_k=min(5, len(chunks))) # Changed top_k to 5
+            # Retrieve more relevant chunks (top_k increased to 8)
+            relevant_chunks = store.search(q_emb, top_k=min(8, len(chunks))) # Changed top_k to 8
+            
+            # --- RIGOROUS LOGGING: Log the chunks passed to LLM ---
+            question_logger.info(f"Context chunks passed to LLM for Q{i+1}:")
+            for j, chunk in enumerate(relevant_chunks):
+                question_logger.info(f"  Chunk {j+1} (length {len(chunk.split())} words): '{chunk[:200]}...'")
+            # --- END RIGOROUS LOGGING ---
+
             context = "\n---\n".join(relevant_chunks)
             
             # Answer using Gemini
