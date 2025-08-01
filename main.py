@@ -10,51 +10,47 @@ import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Tuple
-import google.generativeai as genai
+from openai import OpenAI # The OpenAI library is compatible with OpenRouter's API
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Gemini API Setup ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    logger.error("GEMINI_API_KEY environment variable not set.")
-    raise ValueError("GEMINI_API_KEY environment variable not set. Cannot proceed.")
+# --- API Setup for Unified OpenRouter Access ---
+# A single key is used to access both embedding and chat models via OpenRouter.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+if not DEEPSEEK_API_KEY:
+    logger.error("DEEPSEEK_API_KEY environment variable not set.")
+    raise ValueError("DEEPSEEK_API_KEY environment variable not set. Cannot proceed.")
 
-genai.configure(api_key=GEMINI_API_KEY)
-logger.info(f"DEBUG: Using Gemini API Key starting with: {GEMINI_API_KEY[:5]}*****")
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=DEEPSEEK_API_KEY,
+)
+logger.info(f"DEBUG: Using API Key starting with: {DEEPSEEK_API_KEY[:5]}*****")
 
 # --- Feature Flags ---
 ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "true"
 logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING}")
 
-def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.5) -> List[float]:
-    """Generates Gemini embeddings with exponential backoff."""
-    for i in range(retries):
-        try:
-            resp = genai.embed_content(model="models/embedding-001", content=[text])
-            embedding_vector = resp["embedding"]
-            if isinstance(embedding_vector, list) and len(embedding_vector) == 1 and isinstance(embedding_vector[0], list):
-                embedding_vector = embedding_vector[0]
-            return embedding_vector
-        except Exception as e:
-            logger.warning(f"Embedding generation failed (Attempt {i+1}/{retries}): {e}")
-            if i < retries - 1:
-                sleep_time = backoff_factor * (2 ** i)
-                time.sleep(sleep_time)
-            else:
-                logger.error(f"Final embedding generation failed after {retries} retries: {e}")
-                raise
+def get_embedding(text: str, model: str = "nomic-ai/nomic-embed-text-v1.5") -> List[float]:
+    """Generates embeddings using a model from OpenRouter."""
+    try:
+        response = client.embeddings.create(
+            input=text,
+            model=model
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        logger.error(f"Error generating embedding with {model}: {e}")
+        raise
 
 def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5, retries: int = 3, backoff_factor: float = 0.5) -> List[str]:
     """
-    Uses Gemini to re-rank a list of chunks based on their relevance to the query.
+    Uses Deepseek to re-rank a list of chunks based on their relevance to the query.
     """
     if not chunks:
         return []
-
-    model = genai.GenerativeModel("gemini-1.5-flash")
 
     rerank_prompt = (
         f"Given the user query and a list of text segments, identify the {top_n_rerank} most relevant segments.\n"
@@ -68,55 +64,58 @@ def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5
     
     for i in range(retries):
         try:
-            logger.info(f"Calling Gemini for chunk re-ranking (Attempt {i+1}/{retries}) with {len(chunks)} chunks.")
-            resp = model.generate_content(rerank_prompt)
-            ranked_segments_text = resp.text.strip()
+            logger.info(f"Calling Deepseek for chunk re-ranking (Attempt {i+1}/{retries}) with {len(chunks)} chunks.")
+            chat_response = client.chat.completions.create(
+                model="deepseek/deepseek-chat-v3-0324:free",
+                messages=[{"role": "user", "content": rerank_prompt}],
+            )
+            ranked_segments_text = chat_response.choices[0].message.content.strip()
             
             re_ranked_chunks = [line.strip() for line in ranked_segments_text.split('\n') if line.strip()]
             final_re_ranked = [original for original in chunks if original.strip() in re_ranked_chunks][:top_n_rerank]
             
             if len(final_re_ranked) < top_n_rerank and len(chunks) > 0:
-                logger.warning(f"Gemini re-ranking returned fewer than {top_n_rerank} chunks. Falling back to original top N.")
+                logger.warning(f"Deepseek re-ranking returned fewer than {top_n_rerank} chunks. Falling back to original top N.")
                 return chunks[:top_n_rerank]
             return final_re_ranked
         except Exception as e:
-            logger.warning(f"Gemini re-ranking failed (Attempt {i+1}/{retries}): {e}")
+            logger.warning(f"Deepseek re-ranking failed (Attempt {i+1}/{retries}): {e}")
             if i < retries - 1:
                 sleep_time = backoff_factor * (2 ** i)
                 time.sleep(sleep_time)
             else:
-                logger.error(f"Final Gemini re-ranking failed after {retries} retries: {e}")
+                logger.error(f"Final Deepseek re-ranking failed after {retries} retries: {e}")
                 return chunks[:top_n_rerank]
 
 def summarize_context(context: str, retries: int = 3, backoff_factor: float = 0.5) -> str:
     """
-    Uses Gemini to provide a concise, 3-4 line summary of the context.
+    Uses Deepseek to provide a concise, 3-4 line summary of the context.
     """
-    model = genai.GenerativeModel("gemini-1.5-flash")
     summary_prompt = (
         f"Given the following text, provide a concise summary of the key points in 3-4 lines.\n\n"
         f"**Text:**\n{context}"
     )
     for i in range(retries):
         try:
-            logger.info("Calling Gemini for context summarization.")
-            resp = model.generate_content(summary_prompt)
-            return resp.text.strip()
+            logger.info("Calling Deepseek for context summarization.")
+            chat_response = client.chat.completions.create(
+                model="deepseek/deepseek-chat-v3-0324:free",
+                messages=[{"role": "user", "content": summary_prompt}],
+            )
+            return chat_response.choices[0].message.content.strip()
         except Exception as e:
-            logger.warning(f"Gemini summarization failed (Attempt {i+1}/{retries}): {e}")
+            logger.warning(f"Deepseek summarization failed (Attempt {i+1}/{retries}): {e}")
             if i < retries - 1:
                 sleep_time = backoff_factor * (2 ** i)
                 time.sleep(sleep_time)
             else:
-                logger.error(f"Final Gemini summarization failed after {retries} retries: {e}")
+                logger.error(f"Final Deepseek summarization failed after {retries} retries: {e}")
                 return "Failed to summarize context."
 
-def gemini_answer(question: str, context: str, retries: int = 3, backoff_factor: float = 0.5) -> str:
+def deepseek_answer(question: str, context: str, retries: int = 3, backoff_factor: float = 0.5) -> str:
     """
-    Uses Gemini to answer a question based on provided context with exponential backoff.
+    Uses Deepseek to answer a question based on provided context with exponential backoff.
     """
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    
     prompt = (
         f"Given the following context from a policy/contract:\n\n{context}\n\n"
         f"Answer the question: '{question}' concisely and directly in a complete sentence. "
@@ -126,15 +125,18 @@ def gemini_answer(question: str, context: str, retries: int = 3, backoff_factor:
     
     for i in range(retries):
         try:
-            resp = model.generate_content(prompt)
-            return resp.text.strip()
+            chat_response = client.chat.completions.create(
+                model="deepseek/deepseek-chat-v3-0324:free",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return chat_response.choices[0].message.content.strip()
         except Exception as e:
-            logger.warning(f"Gemini answer generation failed (Attempt {i+1}/{retries}): {e}")
+            logger.warning(f"Deepseek answer generation failed (Attempt {i+1}/{retries}): {e}")
             if i < retries - 1:
                 sleep_time = backoff_factor * (2 ** i)
                 time.sleep(sleep_time)
             else:
-                logger.error(f"Final Gemini answer generation failed after {retries} retries: {e}")
+                logger.error(f"Final Deepseek answer generation failed after {retries} retries: {e}")
                 return f"Error processing question: Failed to get an answer after multiple attempts due to API issues. Last error: {e}"
 
 # --- Document Parsing and other functions remain the same ---
@@ -279,15 +281,15 @@ def run_query(req: QueryRequest):
         if not chunks:
             raise HTTPException(status_code=400, detail="No chunks generated from document. Text might be too short or chunking failed.")
         logger.info(f"Created {len(chunks)} chunks from document.")
-        embeddings = [get_gemini_embedding(chunk) for chunk in chunks]
+        embeddings = [get_embedding(chunk) for chunk in chunks]
         logger.info(f"Generated {len(embeddings)} embeddings for chunks.")
         if not embeddings:
             raise HTTPException(status_code=500, detail="Failed to generate any embeddings.")
 
         if embeddings:
             first_embedding_dim = len(embeddings[0])
-            if first_embedding_dim != 768:
-                logger.error(f"Expected embedding dimension 768, but got {first_embedding_dim}. This is unexpected.")
+            if first_embedding_dim != 1536: # OpenAI embeddings dimension
+                logger.error(f"Expected embedding dimension 1536, but got {first_embedding_dim}. This is unexpected.")
             logger.info(f"First embedding dimension: {first_embedding_dim}")
             for i, emb in enumerate(embeddings):
                 if len(emb) != first_embedding_dim:
@@ -314,7 +316,7 @@ def run_query(req: QueryRequest):
         question_logger = logger.getChild(f"Question-{i+1}")
         try:
             question_logger.info(f"Processing question {i+1}/{len(req.questions)}: '{q[:100]}...'")
-            q_emb = get_gemini_embedding(q)
+            q_emb = get_embedding(q)
             logger.info(f"Query embedding dimension: {len(q_emb)}")
 
             faiss_relevant_chunks = store.search(q_emb, top_k=8)
