@@ -324,9 +324,12 @@ def read_root():
 class QueryRequest(BaseModel):
     documents: str  # URL to the document (e.g., PDF, DOCX, EML)
     questions: List[str]  # List of questions to ask about the document
+class AnswerWithContext(BaseModel):
+    answer: str
+    context: str
 
 class QueryResponse(BaseModel):
-    answers: List[str]  # List of answers corresponding to the questions
+    answers: List[AnswerWithContext] # Update to return both answer and context
 
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 def run_query(req: QueryRequest):
@@ -414,7 +417,7 @@ def run_query(req: QueryRequest):
             raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): {e}")
 
     # 3. For each question: retrieve, reason, answer
-    answers = []
+    answers_with_context = []
     for i, q in enumerate(req.questions):
         question_logger = logger.getChild(f"Question-{i+1}")  # Specific logger for each question
         try:
@@ -454,11 +457,14 @@ def run_query(req: QueryRequest):
             
             # Answer using Gemini
             answer = gemini_answer(q, context)
-            answers.append(answer.strip())
+            
+            # --- Capture Answer and Context for Response ---
+            answers_with_context.append({"answer": answer.strip(), "context": context})
+            # --- End Capture ---
             question_logger.info(f"Successfully answered question {i+1}.")
         except Exception as e:
             question_logger.error(f"Error processing question {i+1}: {e}")
-            answers.append(f"Error processing question: {e}")  # Return error message for specific question
+            answers_with_context.append({"answer": f"Error processing question: {e}", "context": ""})  # Return error message for specific question
 
     logger.info("All questions processed. Returning responses.")
-    return {"answers": answers}
+    return {"answers": answers_with_context}
