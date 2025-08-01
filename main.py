@@ -6,6 +6,7 @@ import docx
 import faiss
 import numpy as np
 import logging  # Import logging module
+import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Tuple
@@ -42,30 +43,34 @@ ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "tru
 logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING}")
 
 
-def get_gemini_embedding(text: str) -> List[float]:
+def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.5) -> List[float]:
     """
-    Generates Gemini embeddings for the given text.
-    Includes a critical fix to ensure the embedding is a flat list of floats.
+    Generates Gemini embeddings for the given text with exponential backoff.
     """
-    try:
-        # Call genai.embed_content directly with the model name and content.
-        # The content is provided as a list, as expected by the API.
-        resp = genai.embed_content(model="models/embedding-001", content=[text])
-        
-        # The response structure for resp["embedding"] can sometimes be a list containing
-        # the actual embedding vector (e.g., [[...]]).
-        # This block ensures we always extract the flat 768-dimensional list of floats.
-        embedding_vector = resp["embedding"]
-        
-        if isinstance(embedding_vector, list) and len(embedding_vector) == 1 and isinstance(embedding_vector[0], list):
-            embedding_vector = embedding_vector[0]
-            logger.info("DEBUG: Extracted inner list from embedding response.")
+    for i in range(retries):
+        try:
+            # Call genai.embed_content directly with the model name and content.
+            # The content is provided as a list, as expected by the API.
+            resp = genai.embed_content(model="models/embedding-001", content=[text])
             
-        return embedding_vector
-        
-    except Exception as e:
-        logger.error(f"Error generating embedding for text: '{text[:50]}...': {e}")
-        raise # Re-raise the exception after logging
+            # The response structure for resp["embedding"] can sometimes be a list containing
+            # the actual embedding vector (e.g., [[...]]).
+            # This block ensures we always extract the flat 768-dimensional list of floats.
+            embedding_vector = resp["embedding"]
+            
+            if isinstance(embedding_vector, list) and len(embedding_vector) == 1 and isinstance(embedding_vector[0], list):
+                embedding_vector = embedding_vector[0]
+                
+            return embedding_vector
+        except Exception as e:
+            logger.warning(f"Embedding generation failed (Attempt {i+1}/{retries}): {e}")
+            if i < retries - 1:
+                sleep_time = backoff_factor * (2 ** i)
+                logger.info(f"Retrying after {sleep_time} seconds...")
+                time.sleep(sleep_time)
+            else:
+                logger.error(f"Final embedding generation failed after {retries} retries: {e}")
+                raise
 
 def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5) -> List[str]:
     """
@@ -457,14 +462,3 @@ def run_query(req: QueryRequest):
 
     logger.info("All questions processed. Returning responses.")
     return {"answers": answers}
-
-# --- For local development or Render deployment ---
-# This block is typically removed or commented out for Docker-based deployments
-# like on Render, as the Dockerfile's CMD instruction handles the server startup.
-# if __name__ == "__main__":
-#     import uvicorn
-#     # Get port from environment variable set by Render, or default to 8000
-#     port = int(os.environ.get("PORT", 8000))
-#     logger.info(f"Starting Uvicorn server on http://0.0.0.0:{port}")
-#     # reload=True is good for local development, set to False for production on Render
-#     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True if os.getenv("ENV") == "development" else False)
