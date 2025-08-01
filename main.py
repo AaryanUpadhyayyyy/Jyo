@@ -377,7 +377,7 @@ def run_query(req: QueryRequest):
             logger.info(f"DEBUG: Length of first embedding (len(embeddings[0])): {len(embeddings[0])}")
             # Log a small snippet of the first embedding to see its structure
             logger.info(f"DEBUG: First 10 elements of embeddings[0]: {embeddings[0][:10]}")
-        # --- END CRITICAL DEBUG LOGGING ---
+        # --- END CRITICAL DEBUGGING ---
 
         # --- Embedding Dimension Consistency Check ---
         # This ensures all embeddings have the same expected dimension (768 for embedding-001)
