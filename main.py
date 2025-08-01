@@ -66,6 +66,7 @@ def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5
     rerank_prompt = (
         f"Given the user query and a list of text segments, rank the top {top_n_rerank} most relevant segments.\n"
         f"Return ONLY the content of the selected segments, each on a new line, exactly as they appear in the input list.\n"
+        f"If fewer than {top_n_rerank} relevant segments are found, return all relevant ones.\n\n"
         f"Query: '{query}'\n\n"
         f"Text Segments (each prefixed with 'Segment X:'):"
     )
@@ -104,6 +105,28 @@ def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5
             else:
                 logger.error(f"Final Deepseek re-ranking failed after {retries} retries: {e}")
                 return chunks[:top_n_rerank]
+
+def summarize_context(context: str) -> str:
+    """
+    Uses Deepseek to provide a concise, 3-4 line summary of the context.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+    }
+    payload = {
+        "model": "deepseek-llm",
+        "messages": [{"role": "user", "content": f"Given the following text, provide a concise summary of the key points in 3-4 lines.\n\n**Text:**\n{context}"}]
+    }
+    try:
+        logger.info("Calling Deepseek for context summarization.")
+        response = requests.post(DEEPSEEK_API_ENDPOINT, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        response_json = response.json()
+        return response_json['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        logger.error(f"Error generating context summary: {e}")
+        return "Failed to summarize context."
 
 def deepseek_answer(question: str, context: str, retries: int = 3, backoff_factor: float = 0.5) -> str:
     """
@@ -252,6 +275,7 @@ class QueryRequest(BaseModel):
 class AnswerWithContext(BaseModel):
     answer: str
     context: str
+
 class QueryResponse(BaseModel):
     answers: List[AnswerWithContext]
 
@@ -338,11 +362,9 @@ def run_query(req: QueryRequest):
             context_for_llm = "\n---\n".join(final_context_chunks)
             answer = deepseek_answer(q, context_for_llm)
             
-            # --- Capture Answer and Context for Response ---
             summarized_context = summarize_context(context_for_llm)
             
             answers_with_context.append({"answer": answer.strip(), "context": summarized_context})
-            # --- End Capture ---
             question_logger.info(f"Successfully answered question {i+1}.")
         except Exception as e:
             question_logger.error(f"Error processing question {i+1}: {e}")
