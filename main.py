@@ -42,20 +42,14 @@ genai.configure(api_key=GEMINI_API_KEY)
 ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "true"
 logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING}")
 
-
 def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.5) -> List[float]:
     """
     Generates Gemini embeddings for the given text with exponential backoff.
     """
     for i in range(retries):
         try:
-            # Call genai.embed_content directly with the model name and content.
-            # The content is provided as a list, as expected by the API.
             resp = genai.embed_content(model="models/embedding-001", content=[text])
             
-            # The response structure for resp["embedding"] can sometimes be a list containing
-            # the actual embedding vector (e.g., [[...]]).
-            # This block ensures we always extract the flat 768-dimensional list of floats.
             embedding_vector = resp["embedding"]
             
             if isinstance(embedding_vector, list) and len(embedding_vector) == 1 and isinstance(embedding_vector[0], list):
@@ -75,15 +69,6 @@ def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.
 def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5) -> List[str]:
     """
     Uses Gemini to re-rank a list of chunks based on their relevance to the query.
-    This helps filter out less relevant chunks even if their embeddings were close.
-    
-    Args:
-        query (str): The user's question.
-        chunks (List[str]): A list of candidate text chunks.
-        top_n_rerank (int): The number of top-ranked chunks to return.
-
-    Returns:
-        List[str]: A list of re-ranked (and potentially filtered) chunks.
     """
     if not chunks:
         return []
@@ -91,90 +76,81 @@ def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5
     model = genai.GenerativeModel("gemini-1.5-flash")
 
     rerank_prompt = (
-        f"Given the following user query and a list of text segments, "
-        f"identify the {top_n_rerank} most relevant segments that are most likely to contain the answer to the query. "
-        f"Rank them from most relevant to least relevant.\n"
+        f"Given the user query and a list of text segments, rank the top {top_n_rerank} most relevant segments.\n"
         f"Return ONLY the content of the selected segments, each on a new line, exactly as they appear in the input list.\n"
-        f"Do NOT add any introductory or concluding remarks, just the segments.\n"
         f"If fewer than {top_n_rerank} relevant segments are found, return all relevant ones.\n\n"
-        f"**User Query:** '{query}'\n\n"
-        f"**Text Segments (each prefixed with 'Segment X:'):**\n"
+        f"Query: '{query}'\n\n"
+        f"Text Segments (each prefixed with 'Segment X:'):"
     )
     for i, chunk in enumerate(chunks):
-        rerank_prompt += f"Segment {i+1}: {chunk}\n"
+        rerank_prompt += f"\nSegment {i+1}: {chunk}"
     
     try:
         logger.info(f"Calling Gemini for chunk re-ranking with {len(chunks)} chunks.")
         resp = model.generate_content(rerank_prompt)
         ranked_segments_text = resp.text.strip()
         
-        # Parse the response to extract the re-ranked chunks
-        re_ranked_chunks = []
-        for line in ranked_segments_text.split('\n'):
-            # Simple heuristic: try to match the exact segment content
-            # This can be improved with more robust parsing if Gemini's output varies
-            for original_chunk in chunks:
-                if original_chunk.strip() == line.strip():
-                    re_ranked_chunks.append(original_chunk)
-                    break
+        re_ranked_chunks = [line.strip() for line in ranked_segments_text.split('\n') if line.strip()]
         
-        # Ensure we return at most top_n_rerank unique chunks in order
-        seen_chunks = set()
-        final_re_ranked = []
-        for chunk in re_ranked_chunks:
-            if chunk not in seen_chunks:
-                final_re_ranked.append(chunk)
-                seen_chunks.add(chunk)
-            if len(final_re_ranked) >= top_n_rerank:
-                break
+        final_re_ranked = [original for original in chunks if original.strip() in re_ranked_chunks][:top_n_rerank]
         
-        # If Gemini didn't return enough, fall back to top_n_rerank from original list
-        if len(final_re_ranked) < top_n_rerank and len(chunks) > 0:
-            logger.warning(f"Gemini re-ranking returned fewer than {top_n_rerank} chunks. Falling back to top {top_n_rerank} from original retrieval.")
-            return chunks[:top_n_rerank] # Fallback to original top N
-        
-        return final_re_ranked
+        if final_re_ranked:
+            return final_re_ranked
 
+        logger.warning(f"Re-ranking returned no valid chunks. Falling back to original top N.")
+        return chunks[:top_n_rerank]
+    
     except Exception as e:
         logger.error(f"Error during LLM-aided chunk re-ranking for query '{query[:50]}...': {e}")
-        # Fallback to original chunks if re-ranking fails
-        return chunks[:top_n_rerank] # Return original top_n_rerank chunks if re-ranking fails
+        return chunks[:top_n_rerank]
 
+def summarize_context(context: str) -> str:
+    """
+    Uses Gemini to provide a concise, 3-4 line summary of the context.
+    """
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    summary_prompt = (
+        f"Given the following text, provide a concise summary of the key points in 3-4 lines.\n\n"
+        f"**Text:**\n{context}"
+    )
+    try:
+        resp = model.generate_content(summary_prompt)
+        return resp.text.strip()
+    except Exception as e:
+        logger.error(f"Error generating context summary: {e}")
+        return "Failed to summarize context."
 
 def gemini_answer(question: str, context: str) -> str:
     """
     Uses Gemini to answer a question based on provided context.
-    Model changed from 'gemini-pro' to 'gemini-1.5-flash' for broader availability.
     This version simplifies the prompt for a concise, direct answer.
     """
     model = genai.GenerativeModel("gemini-1.5-flash")
     
-    # --- SIMPLIFIED, CONCISE PROMPT FOR DIRECT ANSWERS ---
     prompt = (
         f"Given the following context from a policy/contract:\n\n{context}\n\n"
         f"Answer the question: '{question}' concisely and directly in a complete sentence. "
         f"If the answer is not in the context, say 'The provided text does not contain this information.'. "
         f"Do not add any additional commentary, reasoning, or quotes unless they are the direct answer."
     )
-    # --- END SIMPLIFIED, CONCISE PROMPT ---
-
+    
     try:
         resp = model.generate_content(prompt)
         return resp.text
     except Exception as e:
         logger.error(f"Error generating answer from Gemini for question: '{question[:50]}...': {e}")
-        raise # Re-raise the exception after logging
+        raise
 
 # --- Document Parsing Functions ---
 def extract_text_from_pdf(url: str) -> str:
     """Extracts text from a PDF document given its URL."""
     response = requests.get(url)
-    response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+    response.raise_for_status()
     doc = fitz.open(stream=response.content, filetype="pdf")
     text = ""
     for page in doc:
         text += page.get_text()
-    doc.close()  # Close the document after processing
+    doc.close()
     return text
 
 def extract_text_from_docx(url: str) -> str:
@@ -188,17 +164,16 @@ def extract_text_from_email(url: str) -> str:
     """Extracts text from an EML (email) file given its URL."""
     response = requests.get(url)
     response.raise_for_status()
-    from email import message_from_bytes  # Import here to avoid global import if not always used
+    from email import message_from_bytes
     msg = message_from_bytes(response.content)
     payload = ""
     if msg.is_multipart():
         for part in msg.walk():
             ctype = part.get_content_type()
             cdispo = str(part.get('Content-Disposition'))
-            # Only consider plain text parts that are not attachments
             if ctype == 'text/plain' and 'attachment' not in cdispo:
                 payload = part.get_payload(decode=True).decode(errors="ignore")
-                break  # Take the first plain text part
+                break
     else:
         payload = msg.get_payload(decode=True).decode(errors="ignore")
     return payload
@@ -214,9 +189,8 @@ def extract_text(url: str) -> str:
         elif url.lower().endswith(".eml"):
             return extract_text_from_email(url)
         else:
-            # Fallback/default logic for URLs without clear extension
             logger.warning(f"URL does not have a clear file extension: {url}. Attempting as PDF by default.")
-            return extract_text_from_pdf(url)  # Default to PDF
+            return extract_text_from_pdf(url)
     except requests.exceptions.RequestException as req_e:
         logger.error(f"Network or HTTP error fetching document from {url}: {req_e}")
         raise ValueError(f"Failed to fetch document from URL: {req_e}")
@@ -237,38 +211,30 @@ def chunk_text(text: str, max_chunk_words: int = 1000, chunk_overlap_words: int 
     for paragraph in paragraphs:
         paragraph_words = paragraph.split()
         
-        # Check if adding the current paragraph would exceed the max_chunk_words
-        # and if there's already content in current_chunk_words
         if len(current_chunk_words) + len(paragraph_words) > max_chunk_words and current_chunk_words:
             chunks.append(" ".join(current_chunk_words))
             
-            # Create overlap for the next chunk
             overlap_words = current_chunk_words[max(0, len(current_chunk_words) - chunk_overlap_words):]
             current_chunk_words = overlap_words
         
-        # Handle paragraphs that are larger than max_chunk_words by splitting them
         if len(paragraph_words) > max_chunk_words:
-            # Add any accumulated current_chunk_words before processing large paragraph
             if current_chunk_words:
                 chunks.append(" ".join(current_chunk_words))
-                current_chunk_words = [] # Reset for next accumulation
+                current_chunk_words = []
 
-            # Split the large paragraph into sub-chunks with overlap
             sub_start_index = 0
             while sub_start_index < len(paragraph_words):
                 sub_end_index = min(sub_start_index + max_chunk_words, len(paragraph_words))
                 sub_chunk = " ".join(paragraph_words[sub_start_index:sub_end_index])
                 chunks.append(sub_chunk)
                 sub_start_index += max_chunk_words - chunk_overlap_words
-                # Ensure sub_start_index doesn't go backwards if overlap is larger than chunk_size
-                if sub_start_index < 0: 
+                if sub_start_index < 0:
                     sub_start_index = 0
             
-            current_chunk_words = [] # Reset after handling large paragraph
+            current_chunk_words = []
         else:
             current_chunk_words.extend(paragraph_words)
     
-    # Add any remaining words in current_chunk_words as the last chunk
     if current_chunk_words:
         chunks.append(" ".join(current_chunk_words))
 
@@ -277,15 +243,14 @@ def chunk_text(text: str, max_chunk_words: int = 1000, chunk_overlap_words: int 
 def keyword_search(query: str, all_chunks: List[str], top_n_keywords: int = 3) -> List[str]:
     """
     Performs a simple keyword search to find chunks containing query terms.
-    Extracts keywords from the query and finds chunks that contain them.
     """
-    query_words = [word.lower() for word in query.split() if len(word) > 2] # Filter out very short words
+    query_words = [word.lower() for word in query.split() if len(word) > 2]
     
     relevant_keyword_chunks = []
     for chunk in all_chunks:
         if any(keyword in chunk.lower() for keyword in query_words):
             relevant_keyword_chunks.append(chunk)
-            if len(relevant_keyword_chunks) >= top_n_keywords: # Limit number of keyword chunks
+            if len(relevant_keyword_chunks) >= top_n_keywords:
                 break
     return relevant_keyword_chunks
 
@@ -293,19 +258,14 @@ def keyword_search(query: str, all_chunks: List[str], top_n_keywords: int = 3) -
 class VectorStore:
     """In-memory FAISS vector store for document chunks."""
     def __init__(self, dim: int):
-        # Initialize FAISS index with the correct dimension
         self.index = faiss.IndexFlatL2(dim)
         self.chunks = []
 
     def add(self, embeddings: List[List[float]], chunks: List[str]):
-        """Adds embeddings and their corresponding text chunks to the store."""
-        # Ensure embeddings are float32 as required by FAISS
         self.index.add(np.array(embeddings).astype("float32"))
         self.chunks.extend(chunks)
 
-    def search(self, embedding: List[float], top_k: int = 8): # Increased top_k to 8 for more context
-        """Searches for the most similar chunks to a given embedding."""
-        # Ensure query embedding is float32 and 2D array for FAISS search
+    def search(self, embedding: List[float], top_k: int = 8):
         D, I = self.index.search(np.array([embedding]).astype("float32"), top_k)
         return [self.chunks[i] for i in I[0]]
 
@@ -318,28 +278,22 @@ app = FastAPI(
 
 @app.get("/")
 def read_root():
-    """Root endpoint to confirm the API is running."""
     return {"message": "LLM-Powered Query Retrieval System is running!", "endpoint": "/api/v1/hackrx/run"}
 
 class QueryRequest(BaseModel):
-    documents: str  # URL to the document (e.g., PDF, DOCX, EML)
-    questions: List[str]  # List of questions to ask about the document
+    documents: str
+    questions: List[str]
 class AnswerWithContext(BaseModel):
     answer: str
     context: str
 
 class QueryResponse(BaseModel):
-    answers: List[AnswerWithContext] # Update to return both answer and context
+    answers: List[AnswerWithContext]
 
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 def run_query(req: QueryRequest):
-    """
-    Main endpoint to process a document and answer questions.
-    Expects a document URL and a list of questions.
-    """
     logger.info(f"Received request for document: {req.documents} with {len(req.questions)} questions.")
 
-    # 1. Download and parse document
     text = ""
     try:
         text = extract_text(req.documents)
@@ -349,19 +303,17 @@ def run_query(req: QueryRequest):
     except ValueError as ve:
         logger.error(f"Document parsing failed: {ve}")
         raise HTTPException(status_code=400, detail=f"Document parsing failed: {ve}")
-    except HTTPException:  # Re-raise if it was already an HTTPException
+    except HTTPException:
         raise
     except Exception as e:
         logger.error(f"An unexpected error occurred during document parsing: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error during document parsing: {e}")
 
-    # 2. Chunk and embed
     chunks = []
     embeddings = []
     store = None
     try:
-        # Calling chunk_text with new parameters for larger, overlapping, paragraph-aware chunks
-        chunks = chunk_text(text, max_chunk_words=1000, chunk_overlap_words=150) 
+        chunks = chunk_text(text, max_chunk_words=1000, chunk_overlap_words=150)
         if not chunks:
             raise HTTPException(status_code=400, detail="No chunks generated from document. Text might be too short or chunking failed.")
         logger.info(f"Created {len(chunks)} chunks from document.")
@@ -372,26 +324,10 @@ def run_query(req: QueryRequest):
         if not embeddings:
             raise HTTPException(status_code=500, detail="Failed to generate any embeddings.")
 
-        # --- CRITICAL DEBUG LOGGING ---
-        # These logs help diagnose the structure of the embeddings
-        if len(embeddings) > 0:
-            logger.info(f"DEBUG: Type of embeddings list: {type(embeddings)}")
-            logger.info(f"DEBUG: Type of first embedding (embeddings[0]): {type(embeddings[0])}")
-            logger.info(f"DEBUG: Length of first embedding (len(embeddings[0])): {len(embeddings[0])}")
-            # Log a small snippet of the first embedding to see its structure
-            logger.info(f"DEBUG: First 10 elements of embeddings[0]: {embeddings[0][:10]}")
-        # --- END CRITICAL DEBUGGING ---
-
-        # --- Embedding Dimension Consistency Check ---
-        # This ensures all embeddings have the same expected dimension (768 for embedding-001)
         if embeddings:
             first_embedding_dim = len(embeddings[0])
-            # The embedding-001 model is expected to return 768 dimensions.
-            # If it's not 768, it indicates an unexpected issue with the model response.
             if first_embedding_dim != 768:
                 logger.error(f"Expected embedding dimension 768, but got {first_embedding_dim}. This is unexpected.")
-                # You might choose to raise an error here or proceed if you want to allow other dimensions
-                # For now, we proceed as FAISS will handle the dimension passed to VectorStore(dim)
             logger.info(f"First embedding dimension: {first_embedding_dim}")
             for i, emb in enumerate(embeddings):
                 if len(emb) != first_embedding_dim:
@@ -400,7 +336,6 @@ def run_query(req: QueryRequest):
             dim = first_embedding_dim
         else:
             raise HTTPException(status_code=500, detail="No embeddings generated, cannot determine dimension.")
-        # --- END Embedding Dimension Consistency Check ---
 
         logger.info(f"Initializing VectorStore with dimension: {dim}")
         store = VectorStore(dim)
@@ -410,61 +345,50 @@ def run_query(req: QueryRequest):
         raise
     except Exception as e:
         logger.error(f"Error during chunking, embedding, or vector store creation: {e}")
-        # Re-raise with a more specific detail if it's the unpacking error
         if "too many values to unpack" in str(e):
-            raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): Possible dimension mismatch or FAISS issue: {e}")
+            raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): Possible FAISS dimension issue: {e}")
         else:
             raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): {e}")
 
-    # 3. For each question: retrieve, reason, answer
     answers_with_context = []
     for i, q in enumerate(req.questions):
-        question_logger = logger.getChild(f"Question-{i+1}")  # Specific logger for each question
+        question_logger = logger.getChild(f"Question-{i+1}")
         try:
             question_logger.info(f"Processing question {i+1}/{len(req.questions)}: '{q[:100]}...'")
             q_emb = get_gemini_embedding(q)
             logger.info(f"Query embedding dimension: {len(q_emb)}")
-            
-            # --- Retrieval Augmentation ---
-            # 1. Semantic Search (FAISS)
-            faiss_relevant_chunks = store.search(q_emb, top_k=8) # Initial top_k for FAISS
-            question_logger.info(f"FAISS retrieved {len(faiss_relevant_chunks)} chunks.")
 
-            # 2. Keyword Search Augmentation
+            faiss_relevant_chunks = store.search(q_emb, top_k=8)
             keyword_relevant_chunks = keyword_search(q, chunks, top_n_keywords=3)
-            question_logger.info(f"Keyword search retrieved {len(keyword_relevant_chunks)} chunks.")
-
-            # Combine and deduplicate chunks
             combined_candidate_chunks = list(dict.fromkeys(faiss_relevant_chunks + keyword_relevant_chunks))
             question_logger.info(f"Combined candidate chunks (deduplicated): {len(combined_candidate_chunks)} chunks.")
 
-            # 3. LLM-Aided Re-ranking (Conditional based on feature flag)
             if ENABLE_LLM_RERANKING:
-                final_context_chunks = re_rank_chunks_with_llm(q, combined_candidate_chunks, top_n_rerank=5) # Re-rank to top 5
+                final_context_chunks = re_rank_chunks_with_llm(q, combined_candidate_chunks, top_n_rerank=5)
                 question_logger.info(f"LLM re-ranked to {len(final_context_chunks)} final context chunks (re-ranking enabled).")
             else:
-                final_context_chunks = combined_candidate_chunks[:5] # Fallback to top 5 from combined if re-ranking disabled
+                final_context_chunks = combined_candidate_chunks[:5]
                 question_logger.info(f"Re-ranking disabled. Using top 5 from combined candidate chunks.")
-            # --- END Retrieval Augmentation ---
 
-            # --- RIGOROUS LOGGING: Log the chunks passed to LLM ---
             question_logger.info(f"Final context chunks passed to LLM for Q{i+1}:")
             for j, chunk in enumerate(final_context_chunks):
                 question_logger.info(f"  Chunk {j+1} (length {len(chunk.split())} words): '{chunk[:200]}...'")
-            # --- END RIGOROUS LOGGING ---
 
             context = "\n---\n".join(final_context_chunks)
-            
-            # Answer using Gemini
             answer = gemini_answer(q, context)
             
             # --- Capture Answer and Context for Response ---
-            answers_with_context.append({"answer": answer.strip(), "context": context})
+            # Truncate context for a concise output, but provide the full text for the LLM
+            # for a more accurate answer.
+            truncated_context_lines = context.split('\n')[:4]
+            truncated_context = '\n'.join(truncated_context_lines)
+            
+            answers_with_context.append({"answer": answer.strip(), "context": truncated_context})
             # --- End Capture ---
             question_logger.info(f"Successfully answered question {i+1}.")
         except Exception as e:
             question_logger.error(f"Error processing question {i+1}: {e}")
-            answers_with_context.append({"answer": f"Error processing question: {e}", "context": ""})  # Return error message for specific question
+            answers_with_context.append({"answer": f"Error processing question: {e}", "context": ""})
 
     logger.info("All questions processed. Returning responses.")
     return {"answers": answers_with_context}
