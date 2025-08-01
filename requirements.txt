@@ -3,8 +3,7 @@ uvicorn
 requests
 PyMuPDF
 python-docx
-faiss-cpu
+faiss-cpu # Remove the pinned version
 google-generativeai
-numpy
+numpy # Remove the pinned version
 pydantic
-openai # Added the openai library
