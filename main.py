@@ -1,7 +1,7 @@
 import os
 import io
 import requests
-import fitz  # PyMuPDF
+import fitz  # PyMuPD
 import docx
 import faiss
 import numpy as np
@@ -392,3 +392,4 @@ def run_query(req: QueryRequest):
 
     logger.info("All questions processed. Returning responses.")
     return {"answers": answers_with_context}
+
