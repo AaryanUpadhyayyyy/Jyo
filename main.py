@@ -16,23 +16,14 @@ import google.generativeai as genai
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- API Setup for Embeddings (Gemini) and Generation (Deepseek) ---
-# For Embeddings: Gemini API
+# --- Gemini API Setup ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     logger.error("GEMINI_API_KEY environment variable not set.")
     raise ValueError("GEMINI_API_KEY environment variable not set. Cannot proceed.")
+
 genai.configure(api_key=GEMINI_API_KEY)
 logger.info(f"DEBUG: Using Gemini API Key starting with: {GEMINI_API_KEY[:5]}*****")
-
-# For Generation: Deepseek API
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_API_ENDPOINT = os.getenv("DEEPSEEK_API_ENDPOINT")
-if not DEEPSEEK_API_KEY or not DEEPSEEK_API_ENDPOINT:
-    logger.error("DEEPSEEK_API_KEY or DEEPSEEK_API_ENDPOINT environment variable not set.")
-    raise ValueError("Deepseek API key and endpoint must be set. Cannot proceed.")
-logger.info(f"DEBUG: Using Deepseek API Endpoint: {DEEPSEEK_API_ENDPOINT}")
-logger.info(f"DEBUG: Using Deepseek API Key starting with: {DEEPSEEK_API_KEY[:5]}*****")
 
 # --- Feature Flags ---
 ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "true"
@@ -58,13 +49,15 @@ def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.
 
 def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5, retries: int = 3, backoff_factor: float = 0.5) -> List[str]:
     """
-    Uses Deepseek to re-rank a list of chunks based on their relevance to the query.
+    Uses Gemini to re-rank a list of chunks based on their relevance to the query.
     """
     if not chunks:
         return []
 
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
     rerank_prompt = (
-        f"Given the user query and a list of text segments, rank the top {top_n_rerank} most relevant segments.\n"
+        f"Given the user query and a list of text segments, identify the {top_n_rerank} most relevant segments.\n"
         f"Return ONLY the content of the selected segments, each on a new line, exactly as they appear in the input list.\n"
         f"If fewer than {top_n_rerank} relevant segments are found, return all relevant ones.\n\n"
         f"Query: '{query}'\n\n"
@@ -73,65 +66,57 @@ def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5
     for i, chunk in enumerate(chunks):
         rerank_prompt += f"\nSegment {i+1}: {chunk}"
     
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
-    }
-    payload = {
-        "model": "deepseek-llm", # Use the Deepseek model name
-        "messages": [{"role": "user", "content": rerank_prompt}]
-    }
-
     for i in range(retries):
         try:
-            logger.info(f"Calling Deepseek for chunk re-ranking (Attempt {i+1}/{retries}) with {len(chunks)} chunks.")
-            response = requests.post(DEEPSEEK_API_ENDPOINT, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            response_json = response.json()
-            ranked_segments_text = response_json['choices'][0]['message']['content'].strip()
+            logger.info(f"Calling Gemini for chunk re-ranking (Attempt {i+1}/{retries}) with {len(chunks)} chunks.")
+            resp = model.generate_content(rerank_prompt)
+            ranked_segments_text = resp.text.strip()
             
             re_ranked_chunks = [line.strip() for line in ranked_segments_text.split('\n') if line.strip()]
             final_re_ranked = [original for original in chunks if original.strip() in re_ranked_chunks][:top_n_rerank]
             
             if len(final_re_ranked) < top_n_rerank and len(chunks) > 0:
-                logger.warning(f"Deepseek re-ranking returned fewer than {top_n_rerank} chunks. Falling back to original top N.")
+                logger.warning(f"Gemini re-ranking returned fewer than {top_n_rerank} chunks. Falling back to original top N.")
                 return chunks[:top_n_rerank]
             return final_re_ranked
         except Exception as e:
-            logger.warning(f"Deepseek re-ranking failed (Attempt {i+1}/{retries}): {e}")
+            logger.warning(f"Gemini re-ranking failed (Attempt {i+1}/{retries}): {e}")
             if i < retries - 1:
                 sleep_time = backoff_factor * (2 ** i)
                 time.sleep(sleep_time)
             else:
-                logger.error(f"Final Deepseek re-ranking failed after {retries} retries: {e}")
+                logger.error(f"Final Gemini re-ranking failed after {retries} retries: {e}")
                 return chunks[:top_n_rerank]
 
-def summarize_context(context: str) -> str:
+def summarize_context(context: str, retries: int = 3, backoff_factor: float = 0.5) -> str:
     """
-    Uses Deepseek to provide a concise, 3-4 line summary of the context.
+    Uses Gemini to provide a concise, 3-4 line summary of the context.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
-    }
-    payload = {
-        "model": "deepseek-llm",
-        "messages": [{"role": "user", "content": f"Given the following text, provide a concise summary of the key points in 3-4 lines.\n\n**Text:**\n{context}"}]
-    }
-    try:
-        logger.info("Calling Deepseek for context summarization.")
-        response = requests.post(DEEPSEEK_API_ENDPOINT, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        response_json = response.json()
-        return response_json['choices'][0]['message']['content'].strip()
-    except Exception as e:
-        logger.error(f"Error generating context summary: {e}")
-        return "Failed to summarize context."
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    summary_prompt = (
+        f"Given the following text, provide a concise summary of the key points in 3-4 lines.\n\n"
+        f"**Text:**\n{context}"
+    )
+    for i in range(retries):
+        try:
+            logger.info("Calling Gemini for context summarization.")
+            resp = model.generate_content(summary_prompt)
+            return resp.text.strip()
+        except Exception as e:
+            logger.warning(f"Gemini summarization failed (Attempt {i+1}/{retries}): {e}")
+            if i < retries - 1:
+                sleep_time = backoff_factor * (2 ** i)
+                time.sleep(sleep_time)
+            else:
+                logger.error(f"Final Gemini summarization failed after {retries} retries: {e}")
+                return "Failed to summarize context."
 
-def deepseek_answer(question: str, context: str, retries: int = 3, backoff_factor: float = 0.5) -> str:
+def gemini_answer(question: str, context: str, retries: int = 3, backoff_factor: float = 0.5) -> str:
     """
-    Uses Deepseek to answer a question based on provided context with exponential backoff.
+    Uses Gemini to answer a question based on provided context with exponential backoff.
     """
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    
     prompt = (
         f"Given the following context from a policy/contract:\n\n{context}\n\n"
         f"Answer the question: '{question}' concisely and directly in a complete sentence. "
@@ -139,28 +124,17 @@ def deepseek_answer(question: str, context: str, retries: int = 3, backoff_facto
         f"Do not add any additional commentary, reasoning, or quotes unless they are the direct answer."
     )
     
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
-    }
-    payload = {
-        "model": "deepseek-llm",
-        "messages": [{"role": "user", "content": prompt}]
-    }
-
     for i in range(retries):
         try:
-            response = requests.post(DEEPSEEK_API_ENDPOINT, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            response_json = response.json()
-            return response_json['choices'][0]['message']['content'].strip()
+            resp = model.generate_content(prompt)
+            return resp.text.strip()
         except Exception as e:
-            logger.warning(f"Deepseek answer generation failed (Attempt {i+1}/{retries}): {e}")
+            logger.warning(f"Gemini answer generation failed (Attempt {i+1}/{retries}): {e}")
             if i < retries - 1:
                 sleep_time = backoff_factor * (2 ** i)
                 time.sleep(sleep_time)
             else:
-                logger.error(f"Final Deepseek answer generation failed after {retries} retries: {e}")
+                logger.error(f"Final Gemini answer generation failed after {retries} retries: {e}")
                 return f"Error processing question: Failed to get an answer after multiple attempts due to API issues. Last error: {e}"
 
 # --- Document Parsing and other functions remain the same ---
