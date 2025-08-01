@@ -42,6 +42,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "true"
 logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING}")
 
+
 def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.5) -> List[float]:
     """
     Generates Gemini embeddings for the given text with exponential backoff.
@@ -374,16 +375,15 @@ def run_query(req: QueryRequest):
             for j, chunk in enumerate(final_context_chunks):
                 question_logger.info(f"  Chunk {j+1} (length {len(chunk.split())} words): '{chunk[:200]}...'")
 
-            context = "\n---\n".join(final_context_chunks)
-            answer = gemini_answer(q, context)
+            context_for_llm = "\n---\n".join(final_context_chunks)
+            answer = gemini_answer(q, context_for_llm)
             
             # --- Capture Answer and Context for Response ---
             # Truncate context for a concise output, but provide the full text for the LLM
             # for a more accurate answer.
-            truncated_context_lines = context.split('\n')[:4]
-            truncated_context = '\n'.join(truncated_context_lines)
+            summarized_context = summarize_context(context_for_llm)
             
-            answers_with_context.append({"answer": answer.strip(), "context": truncated_context})
+            answers_with_context.append({"answer": answer.strip(), "context": summarized_context})
             # --- End Capture ---
             question_logger.info(f"Successfully answered question {i+1}.")
         except Exception as e:
