@@ -33,7 +33,7 @@ logger.info(f"DEBUG: Using API Key starting with: {DEEPSEEK_API_KEY[:5]}*****")
 ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "true"
 logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING}")
 
-def get_embedding(text: str, model: str = "text-embedding-ada-002") -> List[float]:
+def get_embedding(text: str, model: str = "nomic-ai/nomic-embed-text-v1.5") -> List[float]:
     """Generates embeddings using a model from OpenRouter."""
     try:
         response = client.embeddings.create(
@@ -288,8 +288,8 @@ def run_query(req: QueryRequest):
 
         if embeddings:
             first_embedding_dim = len(embeddings[0])
-            if first_embedding_dim != 1536: # OpenAI embeddings dimension
-                logger.error(f"Expected embedding dimension 1536, but got {first_embedding_dim}. This is unexpected.")
+            if first_embedding_dim != 768:
+                logger.error(f"Expected embedding dimension 768, but got {first_embedding_dim}. This is unexpected.")
             logger.info(f"First embedding dimension: {first_embedding_dim}")
             for i, emb in enumerate(embeddings):
                 if len(emb) != first_embedding_dim:
