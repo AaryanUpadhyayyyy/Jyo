@@ -18,18 +18,17 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- Gemini API Setup with Key Rotation ---
-# Read multiple API keys from a single environment variable
 GEMINI_API_KEYS_STR = os.getenv("GEMINI_API_KEYS")
 if not GEMINI_API_KEYS_STR:
     logger.error("GEMINI_API_KEYS environment variable not set.")
     raise ValueError("GEMINI_API_KEYS environment variable not set. Cannot proceed.")
 
-# Use a deque for efficient key rotation
 GEMINI_API_KEYS = deque(GEMINI_API_KEYS_STR.split(','))
 
 # --- Feature Flags ---
-ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "true"
-logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING}")
+# Re-ranking and summarization are removed for speed in this version.
+ENABLE_LLM_RERANKING = False # Hardcoded to False for a faster pipeline
+logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING} (fixed for speed).")
 
 def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.5) -> List[float]:
     """Generates Gemini embeddings with exponential backoff and key rotation."""
@@ -43,14 +42,13 @@ def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.
             if isinstance(embedding_vector, list) and len(embedding_vector) == 1 and isinstance(embedding_vector[0], list):
                 embedding_vector = embedding_vector[0]
             
-            # If successful, move the key to the back of the queue
             GEMINI_API_KEYS.rotate(-1)
             return embedding_vector
         except Exception as e:
             logger.warning(f"Embedding failed with key ending in {current_key[-5:]} (Attempt {i+1}/{retries*len(GEMINI_API_KEYS)}): {e}")
             if "quota" in str(e).lower() or "rate limit" in str(e).lower():
                 logger.warning("Quota exceeded. Rotating to next key.")
-                GEMINI_API_KEYS.rotate(-1) # Rotate key on quota error
+                GEMINI_API_KEYS.rotate(-1)
             
             if i < (retries * len(GEMINI_API_KEYS)) - 1:
                 sleep_time = backoff_factor * (2 ** (i % retries))
@@ -59,85 +57,6 @@ def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.
             else:
                 logger.error(f"Final embedding generation failed after all retries: {e}")
                 raise
-
-def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5) -> List[str]:
-    """Uses Gemini to re-rank a list of chunks based on their relevance to the query with key rotation."""
-    if not chunks:
-        return []
-
-    model_name = "gemini-2.5-flash-preview-05-20"
-
-    rerank_prompt = (
-        f"Given the user query and a list of text segments, identify the {top_n_rerank} most relevant segments.\n"
-        f"Return ONLY the content of the selected segments, each on a new line, exactly as they appear in the input list.\n"
-        f"If fewer than {top_n_rerank} relevant segments are found, return all relevant ones.\n\n"
-        f"Query: '{query}'\n\n"
-        f"Text Segments (each prefixed with 'Segment X:'):"
-    )
-    for i, chunk in enumerate(chunks):
-        rerank_prompt += f"\nSegment {i+1}: {chunk}"
-    
-    for i in range(3 * len(GEMINI_API_KEYS)):
-        current_key = GEMINI_API_KEYS[0]
-        genai.configure(api_key=current_key)
-        model = genai.GenerativeModel(model_name)
-        
-        try:
-            logger.info(f"Calling Gemini for re-ranking with key ending in {current_key[-5:]}.")
-            resp = model.generate_content(rerank_prompt)
-            ranked_segments_text = resp.text.strip()
-            
-            re_ranked_chunks = [line.strip() for line in ranked_segments_text.split('\n') if line.strip()]
-            final_re_ranked = [original for original in chunks if original.strip() in re_ranked_chunks][:top_n_rerank]
-            
-            if len(final_re_ranked) < top_n_rerank and len(chunks) > 0:
-                logger.warning(f"Re-ranking returned fewer than {top_n_rerank} chunks. Falling back to original top N.")
-            
-            GEMINI_API_KEYS.rotate(-1)
-            return final_re_ranked if final_re_ranked else chunks[:top_n_rerank]
-
-        except Exception as e:
-            logger.warning(f"Re-ranking failed with key ending in {current_key[-5:]} (Attempt {i+1}/{3*len(GEMINI_API_KEYS)}): {e}")
-            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-                logger.warning("Quota exceeded. Rotating to next key.")
-                GEMINI_API_KEYS.rotate(-1)
-            
-            sleep_time = 0.5 * (2 ** (i % 3))
-            logger.info(f"Retrying after {sleep_time} seconds...")
-            time.sleep(sleep_time)
-
-    logger.error("Final re-ranking failed after all retries. Returning original chunks.")
-    return chunks[:top_n_rerank]
-
-def summarize_context(context: str) -> str:
-    """Uses Gemini to provide a concise, 3-4 line summary of the context with key rotation."""
-    for i in range(3 * len(GEMINI_API_KEYS)):
-        current_key = GEMINI_API_KEYS[0]
-        genai.configure(api_key=current_key)
-        model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
-        
-        summary_prompt = (
-            f"Given the following text, provide a concise summary of the key points in 3-4 lines.\n\n"
-            f"**Text:**\n{context}"
-        )
-        
-        try:
-            logger.info(f"Calling Gemini for summarization with key ending in {current_key[-5:]}.")
-            resp = model.generate_content(summary_prompt)
-            GEMINI_API_KEYS.rotate(-1)
-            return resp.text.strip()
-        except Exception as e:
-            logger.warning(f"Summarization failed with key ending in {current_key[-5:]} (Attempt {i+1}/{3*len(GEMINI_API_KEYS)}): {e}")
-            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-                logger.warning("Quota exceeded. Rotating to next key.")
-                GEMINI_API_KEYS.rotate(-1)
-            
-            sleep_time = 0.5 * (2 ** (i % 3))
-            logger.info(f"Retrying after {sleep_time} seconds...")
-            time.sleep(sleep_time)
-            
-    logger.error("Final summarization failed after all retries. Returning default error.")
-    return "Failed to summarize context."
 
 def gemini_answer(question: str, context: str) -> str:
     """Uses Gemini to answer a question based on provided context with key rotation."""
@@ -170,8 +89,9 @@ def gemini_answer(question: str, context: str) -> str:
     logger.error("Final answer generation failed after all retries.")
     return f"Error processing question: Failed to get an answer after multiple attempts due to API issues."
 
-# --- Document Parsing and other functions remain the same ---
+# --- Document Parsing Functions ---
 def extract_text_from_pdf(url: str) -> str:
+    """Extracts text from a PDF document given its URL."""
     response = requests.get(url)
     response.raise_for_status()
     doc = fitz.open(stream=response.content, filetype="pdf")
@@ -182,12 +102,14 @@ def extract_text_from_pdf(url: str) -> str:
     return text
 
 def extract_text_from_docx(url: str) -> str:
+    """Extracts text from a DOCX document given its URL."""
     response = requests.get(url)
     response.raise_for_status()
     doc = docx.Document(io.BytesIO(response.content))
     return "\n".join([p.text for p in doc.paragraphs])
 
 def extract_text_from_email(url: str) -> str:
+    """Extracts text from an EML (email) file given its URL."""
     response = requests.get(url)
     response.raise_for_status()
     from email import message_from_bytes
@@ -205,6 +127,7 @@ def extract_text_from_email(url: str) -> str:
     return payload
 
 def extract_text(url: str) -> str:
+    """Determines file type from URL and extracts text."""
     logger.info(f"Attempting to extract text from URL: {url}")
     try:
         if url.lower().endswith(".pdf"):
@@ -243,4 +166,135 @@ def chunk_text(text: str, max_chunk_words: int = 1000, chunk_overlap_words: int 
                 sub_end_index = min(sub_start_index + max_chunk_words, len(paragraph_words))
                 sub_chunk = " ".join(paragraph_words[sub_start_index:sub_end_index])
                 chunks.append(sub_chunk)
-                sub_start_index += max_chunk_words - chunk_overlap_wo
+                sub_start_index += max_chunk_words - chunk_overlap_words
+                if sub_start_index < 0:
+                    sub_start_index = 0
+            current_chunk_words = []
+        else:
+            current_chunk_words.extend(paragraph_words)
+    if current_chunk_words:
+        chunks.append(" ".join(current_chunk_words))
+    return chunks
+
+def keyword_search(query: str, all_chunks: List[str], top_n_keywords: int = 3) -> List[str]:
+    query_words = [word.lower() for word in query.split() if len(word) > 2]
+    relevant_keyword_chunks = []
+    for chunk in all_chunks:
+        if any(keyword in chunk.lower() for keyword in query_words):
+            relevant_keyword_chunks.append(chunk)
+            if len(relevant_keyword_chunks) >= top_n_keywords:
+                break
+    return relevant_keyword_chunks
+
+# --- FAISS Vector Store ---
+class VectorStore:
+    def __init__(self, dim: int):
+        self.index = faiss.IndexFlatL2(dim)
+        self.chunks = []
+    def add(self, embeddings: List[List[float]], chunks: List[str]):
+        self.index.add(np.array(embeddings).astype("float32"))
+        self.chunks.extend(chunks)
+    def search(self, embedding: List[float], top_k: int = 5): # top_k reduced for speed
+        D, I = self.index.search(np.array([embedding]).astype("float32"), top_k)
+        return [self.chunks[i] for i in I[0]]
+
+# --- FastAPI Setup ---
+app = FastAPI(title="LLM-Powered Document Q&A System", version="1.0.0")
+class QueryRequest(BaseModel):
+    documents: str
+    questions: List[str]
+class AnswerWithContext(BaseModel):
+    answer: str
+    context: str
+
+class QueryResponse(BaseModel):
+    answers: List[str]
+
+@app.post("/api/v1/hackrx/run", response_model=QueryResponse)
+def run_query(req: QueryRequest):
+    logger.info(f"Received request for document: {req.documents} with {len(req.questions)} questions.")
+    text = ""
+    try:
+        text = extract_text(req.documents)
+        logger.info(f"Successfully extracted {len(text)} characters from document: {req.documents}")
+        if not text:
+            raise HTTPException(status_code=400, detail="Extracted text is empty. Document might be unparseable or empty.")
+    except ValueError as ve:
+        logger.error(f"Document parsing failed: {ve}")
+        raise HTTPException(status_code=400, detail=f"Document parsing failed: {ve}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during document parsing: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error during document parsing: {e}")
+
+    chunks = []
+    embeddings = []
+    store = None
+    try:
+        chunks = chunk_text(text, max_chunk_words=700, chunk_overlap_words=100) # Optimized chunking for speed
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No chunks generated from document. Text might be too short or chunking failed.")
+        logger.info(f"Created {len(chunks)} chunks from document.")
+        embeddings = [get_gemini_embedding(chunk) for chunk in chunks]
+        logger.info(f"Generated {len(embeddings)} embeddings for chunks.")
+        if not embeddings:
+            raise HTTPException(status_code=500, detail="Failed to generate any embeddings.")
+
+        if embeddings:
+            first_embedding_dim = len(embeddings[0])
+            if first_embedding_dim != 768:
+                logger.error(f"Expected embedding dimension 768, but got {first_embedding_dim}. This is unexpected.")
+            logger.info(f"First embedding dimension: {first_embedding_dim}")
+            for i, emb in enumerate(embeddings):
+                if len(emb) != first_embedding_dim:
+                    logger.error(f"Inconsistent embedding dimension at index {i}. Expected {first_embedding_dim}, got {len(emb)}")
+                    raise HTTPException(status_code=500, detail="Inconsistent embedding dimensions generated.")
+            dim = first_embedding_dim
+        else:
+            raise HTTPException(status_code=500, detail="No embeddings generated, cannot determine dimension.")
+        logger.info(f"Initializing VectorStore with dimension: {dim}")
+        store = VectorStore(dim)
+        store.add(embeddings, chunks)
+        logger.info("Successfully created and populated FAISS vector store.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during chunking, embedding, or vector store creation: {e}")
+        if "too many values to unpack" in str(e):
+            raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): Possible FAISS dimension issue: {e}")
+        else:
+            raise HTTPException(status_code=500, detail=f"Processing error (chunking/embedding/vector store): {e}")
+
+    answers = []
+    for i, q in enumerate(req.questions):
+        question_logger = logger.getChild(f"Question-{i+1}")
+        try:
+            question_logger.info(f"Processing question {i+1}/{len(req.questions)}: '{q[:100]}...'")
+            q_emb = get_gemini_embedding(q)
+            logger.info(f"Query embedding dimension: {len(q_emb)}")
+
+            faiss_relevant_chunks = store.search(q_emb, top_k=5) # Reduced top_k for speed
+            keyword_relevant_chunks = keyword_search(q, chunks, top_n_keywords=2) # Reduced for speed
+            combined_candidate_chunks = list(dict.fromkeys(faiss_relevant_chunks + keyword_relevant_chunks))
+            question_logger.info(f"Combined candidate chunks (deduplicated): {len(combined_candidate_chunks)} chunks.")
+
+            # No LLM re-ranking or summarization for speed
+            final_context_chunks = combined_candidate_chunks[:5]
+            question_logger.info(f"Re-ranking disabled. Using top 5 from combined candidate chunks.")
+
+            question_logger.info(f"Final context chunks passed to LLM for Q{i+1}:")
+            for j, chunk in enumerate(final_context_chunks):
+                question_logger.info(f"  Chunk {j+1} (length {len(chunk.split())} words): '{chunk[:200]}...'")
+
+            context_for_llm = "\n---\n".join(final_context_chunks)
+            answer = gemini_answer(q, context_for_llm)
+            
+            answers.append(answer.strip())
+            question_logger.info(f"Successfully answered question {i+1}.")
+        except Exception as e:
+            question_logger.error(f"Error processing question {i+1}: {e}")
+            answers.append(f"Error processing question: {e}")
+
+    logger.info("All questions processed. Returning responses.")
+    return {"answers": answers}
