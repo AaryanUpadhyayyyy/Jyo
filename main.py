@@ -1,83 +1,74 @@
 import os
 import io
 import requests
-import fitz  # PyMuPD
+import fitz  # PyMuPDF
 import docx
 import faiss
 import numpy as np
-import logging  # Import logging module
+import logging
 import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Tuple
 import google.generativeai as genai
+from collections import deque
 
-# Configure logging for better visibility in Render logs
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Gemini API Setup ---
-# *** IMPORTANT: Get API key from environment variable for security ***
-# This ensures your API key is not hardcoded and is managed securely by Render.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    logger.error("GEMINI_API_KEY environment variable not set. Please set it in Render dashboard for production.")
-    # For local testing, you might temporarily hardcode it here,
-    # but REMOVE THIS LINE BEFORE DEPLOYING TO GITHUB/RENDER!
-    # Example for local development ONLY: GEMINI_API_KEY = "YOUR_HARDCODED_API_KEY_HERE"
-    raise ValueError("GEMINI_API_KEY environment variable not set. Cannot proceed.")
+# --- Gemini API Setup with Key Rotation ---
+# Read multiple API keys from a single environment variable
+GEMINI_API_KEYS_STR = os.getenv("GEMINI_API_KEYS")
+if not GEMINI_API_KEYS_STR:
+    logger.error("GEMINI_API_KEYS environment variable not set.")
+    raise ValueError("GEMINI_API_KEYS environment variable not set. Cannot proceed.")
 
-# --- CRITICAL DEBUG LOGGING FOR API KEY ---
-# This line will print the first 5 characters of your API key to the logs.
-# This is for DEBUGGING ONLY to confirm which key Render is using.
-# REMOVE THIS LINE IN PRODUCTION FOR SECURITY!
-if GEMINI_API_KEY:
-    logger.info(f"DEBUG: Using Gemini API Key starting with: {GEMINI_API_KEY[:5]}*****")
-# --- END DEBUG LOGGING ---
-
-genai.configure(api_key=GEMINI_API_KEY)
+# Use a deque for efficient key rotation
+GEMINI_API_KEYS = deque(GEMINI_API_KEYS_STR.split(','))
 
 # --- Feature Flags ---
-# Control LLM-aided re-ranking via an environment variable for A/B testing
 ENABLE_LLM_RERANKING = os.getenv("ENABLE_LLM_RERANKING", "true").lower() == "true"
 logger.info(f"Feature Flag: ENABLE_LLM_RERANKING is set to {ENABLE_LLM_RERANKING}")
 
-
 def get_gemini_embedding(text: str, retries: int = 3, backoff_factor: float = 0.5) -> List[float]:
-    """
-    Generates Gemini embeddings for the given text with exponential backoff.
-    """
-    for i in range(retries):
+    """Generates Gemini embeddings with exponential backoff and key rotation."""
+    for i in range(retries * len(GEMINI_API_KEYS)):
+        current_key = GEMINI_API_KEYS[0]
+        genai.configure(api_key=current_key)
+        
         try:
             resp = genai.embed_content(model="models/embedding-001", content=[text])
-            
             embedding_vector = resp["embedding"]
-            
             if isinstance(embedding_vector, list) and len(embedding_vector) == 1 and isinstance(embedding_vector[0], list):
                 embedding_vector = embedding_vector[0]
-                
+            
+            # If successful, move the key to the back of the queue
+            GEMINI_API_KEYS.rotate(-1)
             return embedding_vector
         except Exception as e:
-            logger.warning(f"Embedding generation failed (Attempt {i+1}/{retries}): {e}")
-            if i < retries - 1:
-                sleep_time = backoff_factor * (2 ** i)
+            logger.warning(f"Embedding failed with key ending in {current_key[-5:]} (Attempt {i+1}/{retries*len(GEMINI_API_KEYS)}): {e}")
+            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                logger.warning("Quota exceeded. Rotating to next key.")
+                GEMINI_API_KEYS.rotate(-1) # Rotate key on quota error
+            
+            if i < (retries * len(GEMINI_API_KEYS)) - 1:
+                sleep_time = backoff_factor * (2 ** (i % retries))
                 logger.info(f"Retrying after {sleep_time} seconds...")
                 time.sleep(sleep_time)
             else:
-                logger.error(f"Final embedding generation failed after {retries} retries: {e}")
+                logger.error(f"Final embedding generation failed after all retries: {e}")
                 raise
 
 def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5) -> List[str]:
-    """
-    Uses Gemini to re-rank a list of chunks based on their relevance to the query.
-    """
+    """Uses Gemini to re-rank a list of chunks based on their relevance to the query with key rotation."""
     if not chunks:
         return []
 
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model_name = "gemini-2.5-flash-preview-05-20"
 
     rerank_prompt = (
-        f"Given the user query and a list of text segments, rank the top {top_n_rerank} most relevant segments.\n"
+        f"Given the user query and a list of text segments, identify the {top_n_rerank} most relevant segments.\n"
         f"Return ONLY the content of the selected segments, each on a new line, exactly as they appear in the input list.\n"
         f"If fewer than {top_n_rerank} relevant segments are found, return all relevant ones.\n\n"
         f"Query: '{query}'\n\n"
@@ -86,65 +77,101 @@ def re_rank_chunks_with_llm(query: str, chunks: List[str], top_n_rerank: int = 5
     for i, chunk in enumerate(chunks):
         rerank_prompt += f"\nSegment {i+1}: {chunk}"
     
-    try:
-        logger.info(f"Calling Gemini for chunk re-ranking with {len(chunks)} chunks.")
-        resp = model.generate_content(rerank_prompt)
-        ranked_segments_text = resp.text.strip()
+    for i in range(3 * len(GEMINI_API_KEYS)):
+        current_key = GEMINI_API_KEYS[0]
+        genai.configure(api_key=current_key)
+        model = genai.GenerativeModel(model_name)
         
-        re_ranked_chunks = [line.strip() for line in ranked_segments_text.split('\n') if line.strip()]
-        
-        final_re_ranked = [original for original in chunks if original.strip() in re_ranked_chunks][:top_n_rerank]
-        
-        if final_re_ranked:
-            return final_re_ranked
+        try:
+            logger.info(f"Calling Gemini for re-ranking with key ending in {current_key[-5:]}.")
+            resp = model.generate_content(rerank_prompt)
+            ranked_segments_text = resp.text.strip()
+            
+            re_ranked_chunks = [line.strip() for line in ranked_segments_text.split('\n') if line.strip()]
+            final_re_ranked = [original for original in chunks if original.strip() in re_ranked_chunks][:top_n_rerank]
+            
+            if len(final_re_ranked) < top_n_rerank and len(chunks) > 0:
+                logger.warning(f"Re-ranking returned fewer than {top_n_rerank} chunks. Falling back to original top N.")
+            
+            GEMINI_API_KEYS.rotate(-1)
+            return final_re_ranked if final_re_ranked else chunks[:top_n_rerank]
 
-        logger.warning(f"Re-ranking returned no valid chunks. Falling back to original top N.")
-        return chunks[:top_n_rerank]
-    
-    except Exception as e:
-        logger.error(f"Error during LLM-aided chunk re-ranking for query '{query[:50]}...': {e}")
-        return chunks[:top_n_rerank]
+        except Exception as e:
+            logger.warning(f"Re-ranking failed with key ending in {current_key[-5:]} (Attempt {i+1}/{3*len(GEMINI_API_KEYS)}): {e}")
+            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                logger.warning("Quota exceeded. Rotating to next key.")
+                GEMINI_API_KEYS.rotate(-1)
+            
+            sleep_time = 0.5 * (2 ** (i % 3))
+            logger.info(f"Retrying after {sleep_time} seconds...")
+            time.sleep(sleep_time)
+
+    logger.error("Final re-ranking failed after all retries. Returning original chunks.")
+    return chunks[:top_n_rerank]
 
 def summarize_context(context: str) -> str:
-    """
-    Uses Gemini to provide a concise, 3-4 line summary of the context.
-    """
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    summary_prompt = (
-        f"Given the following text, provide a concise summary of the key points in 3-4 lines.\n\n"
-        f"**Text:**\n{context}"
-    )
-    try:
-        resp = model.generate_content(summary_prompt)
-        return resp.text.strip()
-    except Exception as e:
-        logger.error(f"Error generating context summary: {e}")
-        return "Failed to summarize context."
+    """Uses Gemini to provide a concise, 3-4 line summary of the context with key rotation."""
+    for i in range(3 * len(GEMINI_API_KEYS)):
+        current_key = GEMINI_API_KEYS[0]
+        genai.configure(api_key=current_key)
+        model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
+        
+        summary_prompt = (
+            f"Given the following text, provide a concise summary of the key points in 3-4 lines.\n\n"
+            f"**Text:**\n{context}"
+        )
+        
+        try:
+            logger.info(f"Calling Gemini for summarization with key ending in {current_key[-5:]}.")
+            resp = model.generate_content(summary_prompt)
+            GEMINI_API_KEYS.rotate(-1)
+            return resp.text.strip()
+        except Exception as e:
+            logger.warning(f"Summarization failed with key ending in {current_key[-5:]} (Attempt {i+1}/{3*len(GEMINI_API_KEYS)}): {e}")
+            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                logger.warning("Quota exceeded. Rotating to next key.")
+                GEMINI_API_KEYS.rotate(-1)
+            
+            sleep_time = 0.5 * (2 ** (i % 3))
+            logger.info(f"Retrying after {sleep_time} seconds...")
+            time.sleep(sleep_time)
+            
+    logger.error("Final summarization failed after all retries. Returning default error.")
+    return "Failed to summarize context."
 
 def gemini_answer(question: str, context: str) -> str:
-    """
-    Uses Gemini to answer a question based on provided context.
-    This version simplifies the prompt for a concise, direct answer.
-    """
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    
-    prompt = (
-        f"Given the following context from a policy/contract:\n\n{context}\n\n"
-        f"Answer the question: '{question}' concisely and directly in a complete sentence. "
-        f"If the answer is not in the context, say 'The provided text does not contain this information.'. "
-        f"Do not add any additional commentary, reasoning, or quotes unless they are the direct answer."
-    )
-    
-    try:
-        resp = model.generate_content(prompt)
-        return resp.text
-    except Exception as e:
-        logger.error(f"Error generating answer from Gemini for question: '{question[:50]}...': {e}")
-        raise
+    """Uses Gemini to answer a question based on provided context with key rotation."""
+    for i in range(3 * len(GEMINI_API_KEYS)):
+        current_key = GEMINI_API_KEYS[0]
+        genai.configure(api_key=current_key)
+        model = genai.GenerativeModel("gemini-2.5-flash-preview-05-20")
+        
+        prompt = (
+            f"Given the following context from a policy/contract:\n\n{context}\n\n"
+            f"Answer the question: '{question}' concisely and directly in a complete sentence. "
+            f"If the answer is not in the context, say 'The provided text does not contain this information.'. "
+            f"Do not add any additional commentary, reasoning, or quotes unless they are the direct answer."
+        )
+        
+        try:
+            resp = model.generate_content(prompt)
+            GEMINI_API_KEYS.rotate(-1)
+            return resp.text.strip()
+        except Exception as e:
+            logger.warning(f"Answer failed with key ending in {current_key[-5:]} (Attempt {i+1}/{3*len(GEMINI_API_KEYS)}): {e}")
+            if "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                logger.warning("Quota exceeded. Rotating to next key.")
+                GEMINI_API_KEYS.rotate(-1)
+            
+            sleep_time = 0.5 * (2 ** (i % 3))
+            logger.info(f"Retrying after {sleep_time} seconds...")
+            time.sleep(sleep_time)
 
-# --- Document Parsing Functions ---
+    logger.error("Final answer generation failed after all retries.")
+    return f"Error processing question: Failed to get an answer after multiple attempts due to API issues."
+
+# --- Document Parsing and other functions remain the same ---
 def extract_text_from_pdf(url: str) -> str:
-    """Extracts text from a PDF document given its URL."""
     response = requests.get(url)
     response.raise_for_status()
     doc = fitz.open(stream=response.content, filetype="pdf")
@@ -155,14 +182,12 @@ def extract_text_from_pdf(url: str) -> str:
     return text
 
 def extract_text_from_docx(url: str) -> str:
-    """Extracts text from a DOCX document given its URL."""
     response = requests.get(url)
     response.raise_for_status()
     doc = docx.Document(io.BytesIO(response.content))
     return "\n".join([p.text for p in doc.paragraphs])
 
 def extract_text_from_email(url: str) -> str:
-    """Extracts text from an EML (email) file given its URL."""
     response = requests.get(url)
     response.raise_for_status()
     from email import message_from_bytes
@@ -180,7 +205,6 @@ def extract_text_from_email(url: str) -> str:
     return payload
 
 def extract_text(url: str) -> str:
-    """Determines file type from URL and extracts text."""
     logger.info(f"Attempting to extract text from URL: {url}")
     try:
         if url.lower().endswith(".pdf"):
@@ -199,30 +223,20 @@ def extract_text(url: str) -> str:
         logger.error(f"Error extracting text from {url}: {e}")
         raise ValueError(f"Could not parse document. Check URL and file type: {e}")
 
-# --- Chunking ---
 def chunk_text(text: str, max_chunk_words: int = 1000, chunk_overlap_words: int = 150) -> List[str]:
-    """
-    Splits text into chunks, prioritizing paragraph boundaries, then word-based if paragraphs are too long.
-    Includes overlap for context preservation.
-    """
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     chunks = []
     current_chunk_words = []
-    
     for paragraph in paragraphs:
         paragraph_words = paragraph.split()
-        
         if len(current_chunk_words) + len(paragraph_words) > max_chunk_words and current_chunk_words:
             chunks.append(" ".join(current_chunk_words))
-            
             overlap_words = current_chunk_words[max(0, len(current_chunk_words) - chunk_overlap_words):]
             current_chunk_words = overlap_words
-        
         if len(paragraph_words) > max_chunk_words:
             if current_chunk_words:
                 chunks.append(" ".join(current_chunk_words))
                 current_chunk_words = []
-
             sub_start_index = 0
             while sub_start_index < len(paragraph_words):
                 sub_end_index = min(sub_start_index + max_chunk_words, len(paragraph_words))
@@ -231,22 +245,15 @@ def chunk_text(text: str, max_chunk_words: int = 1000, chunk_overlap_words: int 
                 sub_start_index += max_chunk_words - chunk_overlap_words
                 if sub_start_index < 0:
                     sub_start_index = 0
-            
             current_chunk_words = []
         else:
             current_chunk_words.extend(paragraph_words)
-    
     if current_chunk_words:
         chunks.append(" ".join(current_chunk_words))
-
     return chunks
 
 def keyword_search(query: str, all_chunks: List[str], top_n_keywords: int = 3) -> List[str]:
-    """
-    Performs a simple keyword search to find chunks containing query terms.
-    """
     query_words = [word.lower() for word in query.split() if len(word) > 2]
-    
     relevant_keyword_chunks = []
     for chunk in all_chunks:
         if any(keyword in chunk.lower() for keyword in query_words):
@@ -257,30 +264,18 @@ def keyword_search(query: str, all_chunks: List[str], top_n_keywords: int = 3) -
 
 # --- FAISS Vector Store ---
 class VectorStore:
-    """In-memory FAISS vector store for document chunks."""
     def __init__(self, dim: int):
         self.index = faiss.IndexFlatL2(dim)
         self.chunks = []
-
     def add(self, embeddings: List[List[float]], chunks: List[str]):
         self.index.add(np.array(embeddings).astype("float32"))
         self.chunks.extend(chunks)
-
     def search(self, embedding: List[float], top_k: int = 8):
         D, I = self.index.search(np.array([embedding]).astype("float32"), top_k)
         return [self.chunks[i] for i in I[0]]
 
 # --- FastAPI Setup ---
-app = FastAPI(
-    title="LLM-Powered Document Q&A System",
-    description="API for extracting text from documents, chunking, embedding, and answering questions using Gemini.",
-    version="1.0.0"
-)
-
-@app.get("/")
-def read_root():
-    return {"message": "LLM-Powered Query Retrieval System is running!", "endpoint": "/api/v1/hackrx/run"}
-
+app = FastAPI(title="LLM-Powered Document Q&A System", version="1.0.0")
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -294,7 +289,6 @@ class QueryResponse(BaseModel):
 @app.post("/api/v1/hackrx/run", response_model=QueryResponse)
 def run_query(req: QueryRequest):
     logger.info(f"Received request for document: {req.documents} with {len(req.questions)} questions.")
-
     text = ""
     try:
         text = extract_text(req.documents)
@@ -318,10 +312,8 @@ def run_query(req: QueryRequest):
         if not chunks:
             raise HTTPException(status_code=400, detail="No chunks generated from document. Text might be too short or chunking failed.")
         logger.info(f"Created {len(chunks)} chunks from document.")
-
         embeddings = [get_gemini_embedding(chunk) for chunk in chunks]
         logger.info(f"Generated {len(embeddings)} embeddings for chunks.")
-
         if not embeddings:
             raise HTTPException(status_code=500, detail="Failed to generate any embeddings.")
 
@@ -337,7 +329,6 @@ def run_query(req: QueryRequest):
             dim = first_embedding_dim
         else:
             raise HTTPException(status_code=500, detail="No embeddings generated, cannot determine dimension.")
-
         logger.info(f"Initializing VectorStore with dimension: {dim}")
         store = VectorStore(dim)
         store.add(embeddings, chunks)
@@ -378,13 +369,9 @@ def run_query(req: QueryRequest):
             context_for_llm = "\n---\n".join(final_context_chunks)
             answer = gemini_answer(q, context_for_llm)
             
-            # --- Capture Answer and Context for Response ---
-            # Truncate context for a concise output, but provide the full text for the LLM
-            # for a more accurate answer.
             summarized_context = summarize_context(context_for_llm)
             
             answers_with_context.append({"answer": answer.strip(), "context": summarized_context})
-            # --- End Capture ---
             question_logger.info(f"Successfully answered question {i+1}.")
         except Exception as e:
             question_logger.error(f"Error processing question {i+1}: {e}")
@@ -392,4 +379,3 @@ def run_query(req: QueryRequest):
 
     logger.info("All questions processed. Returning responses.")
     return {"answers": answers_with_context}
-
